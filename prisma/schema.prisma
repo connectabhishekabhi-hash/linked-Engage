@@ -1,0 +1,255 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id               String           @id @default(cuid())
+  email            String           @unique
+  passwordHash     String
+  name             String?
+  apiToken         String?          @unique  // user copies this into the extension
+  extensionToken   String?          @unique  // long-lived token issued to the extension
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  linkedinAccount  LinkedInAccount?
+  leads            Lead[]
+  extensionJobs    ExtensionJob[]
+  campaigns        Campaign[]
+  scheduledPosts   ScheduledPost[]
+  postAnalytics    PostAnalytics[]
+  aiProfile        UserAIProfile?
+  leadSearches     LeadSearch[]
+
+  @@map("app_users")
+}
+
+// ─── Campaign (keyword-trigger DM automation) ─────────────────────────────────
+model Campaign {
+  id              String         @id @default(cuid())
+  userId          String
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name            String
+  targetPostUrl   String         // LinkedIn post to monitor for keyword comments
+  triggerKeyword  String         // e.g. "SEND", "DM ME"
+  messageTemplate String         @db.Text  // DM/connection note to send
+  status          CampaignStatus @default(ACTIVE)
+  leadsTriggered  Int            @default(0)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@index([userId, status])
+}
+
+// ─── ScheduledPost (server-side LinkedIn post scheduler) ─────────────────────
+model ScheduledPost {
+  id              String              @id @default(cuid())
+  userId          String
+  user            User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  content         String              @db.Text
+  scheduledFor    DateTime
+  status          ScheduledPostStatus @default(PENDING)
+  linkedinPostUrn String?             // populated after successful publish
+  errorMessage    String?
+  publishedAt     DateTime?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  @@index([status, scheduledFor])
+  @@index([userId])
+}
+
+// ─── PostAnalytics (viewer demographics from LinkedIn Analytics API) ──────────
+model PostAnalytics {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  postUrn     String
+  postUrl     String?
+  postPreview String?  @db.Text
+  viewerData  Json     // { topCompanies:[{name,count}], topTitles:[{name,count}], totalViews:number }
+  fetchedAt   DateTime @default(now())
+  createdAt   DateTime @default(now())
+
+  @@unique([userId, postUrn])
+  @@index([userId])
+}
+
+// ─── LeadSearch (saved searches executed by the extension) ───────────────────
+model LeadSearch {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  query     String
+  status    LeadSearchStatus @default(PENDING)
+  results   Json?            // SearchProfile[]
+  total     Int              @default(0)
+  error     String?
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  @@index([userId])
+}
+
+enum LeadSearchStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// ─── UserAIProfile (personalised writing voice for AI draft generation) ───────
+model UserAIProfile {
+  id                   String   @id @default(cuid())
+  userId               String   @unique
+  user                 User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // Voice & tone
+  writingStyle         String?  @db.Text  // e.g. "casual and direct, short sentences"
+  toneDescription      String?  @db.Text  // e.g. "confident but humble, no jargon"
+  exampleComment       String?  @db.Text  // a real comment the user has written
+
+  // Language
+  language             String?            // e.g. "English", "Spanish", "Hinglish"
+
+  // Guardrails
+  negativeKeywords     String?  @db.Text  // comma-separated words/phrases to never use
+
+  // Extra free-form
+  additionalInstructions String? @db.Text
+
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+}
+
+model LinkedInAccount {
+  id                  String    @id @default(cuid())
+  userId              String    @unique
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  encryptedCookie     String
+  cookieIv            String
+  linkedinProfileUrl  String?
+  isActive            Boolean   @default(true)
+  lastVerifiedAt      DateTime?
+  // Official LinkedIn OAuth API fields
+  accessToken         String?   @db.Text   // Bearer token for official LinkedIn API
+  tokenExpiry         DateTime?            // When the access token expires
+  linkedinMemberId    String?              // "sub" claim — used as urn:li:person:{id}
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+}
+
+model Lead {
+  id              String         @id @default(cuid())
+  userId          String
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  profileUrl      String
+  profileUrn      String?        // "urn:li:fsd_profile:ACoAAB..." — stored after scrape
+  fullName        String?
+  headline        String?
+  profileImageUrl String?        // avatar from search / scrape
+  connectionDegree String?       // "1st" | "2nd" | "3rd+"
+  scrapedBio      String?        @db.Text
+  scrapedPost     String?        @db.Text   // first post text (kept for backward compat)
+  scrapedPostUrl  String?                   // first post URL
+  activityUrn     String?                   // first post activity URN
+  scrapedPosts    Json?                     // [{text, url, activityUrn}] — up to 3 posts
+  status          LeadStatus     @default(PENDING)
+  drafts          Draft[]
+  extensionJobs   ExtensionJob[]
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  @@unique([userId, profileUrl])
+  @@index([userId, status])
+}
+
+model Draft {
+  id           String      @id @default(cuid())
+  leadId       String
+  lead         Lead        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type         DraftType
+  content      String      @db.Text
+  status       DraftStatus @default(AWAITING_APPROVAL)
+  postUrn      String?     // For COMMENT drafts: which post's activityUrn this belongs to
+  executedAt   DateTime?
+  errorMessage String?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+}
+
+// Jobs dispatched to the Chrome Extension worker
+model ExtensionJob {
+  id          String    @id @default(cuid())
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  leadId      String
+  lead        Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  type        JobType
+  status      JobStatus @default(PENDING)
+  payload     Json                         // { vanityName } | { profileUrn, note } | { activityUrn, commentText }
+  result      Json?
+  error       String?
+  claimedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([userId, status])
+  @@index([status, createdAt])
+}
+
+// ─── Enums ────────────────────────────────────────────────────────────────────
+
+enum LeadStatus {
+  PENDING
+  SCRAPING
+  AWAITING_APPROVAL
+  ENGAGED
+  FAILED
+}
+
+enum DraftType {
+  COMMENT
+  CONNECTION_REQUEST
+  DIRECT_MESSAGE
+}
+
+enum DraftStatus {
+  AWAITING_APPROVAL
+  APPROVED
+  EXECUTING
+  EXECUTED
+  FAILED
+}
+
+enum JobType {
+  SCRAPE
+  COMMENT
+  CONNECTION_REQUEST
+  SEARCH
+}
+
+enum JobStatus {
+  PENDING
+  CLAIMED
+  COMPLETED
+  FAILED
+}
+
+enum CampaignStatus {
+  ACTIVE
+  PAUSED
+  ARCHIVED
+}
+
+enum ScheduledPostStatus {
+  PENDING
+  PUBLISHING
+  PUBLISHED
+  FAILED
+}

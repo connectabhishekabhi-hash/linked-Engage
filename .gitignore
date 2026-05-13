@@ -39,3 +39,14 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+/app/generated/prisma
+
+# debug files
+debug-*.png
+dev.log
+dev-err.log
+start.bat
+
+# claude
+.claude/

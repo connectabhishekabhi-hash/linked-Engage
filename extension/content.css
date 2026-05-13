@@ -1,0 +1,80 @@
+/* ─── LinkedEngage Inline Comment UI ────────────────────────────────────── */
+
+.le-draft-btn {
+  display: inline-flex !important;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  margin: 0 2px;
+  border: 1px solid #c7d2fe;
+  border-radius: 18px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 12px;
+  font-weight: 600;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  line-height: 1.2;
+  white-space: nowrap;
+  z-index: 10;
+  vertical-align: middle;
+  flex-shrink: 0;
+}
+
+.le-draft-btn:hover {
+  background: #c7d2fe;
+  border-color: #818cf8;
+  color: #3730a3;
+}
+
+.le-draft-btn.le-loading {
+  opacity: 0.7;
+  pointer-events: none;
+  cursor: wait;
+}
+
+.le-draft-btn .le-icon {
+  font-size: 13px;
+  line-height: 1;
+}
+
+.le-draft-btn .le-spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid #a5b4fc;
+  border-top-color: #4f46e5;
+  border-radius: 50%;
+  animation: le-spin 0.6s linear infinite;
+}
+
+@keyframes le-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Toast notification */
+.le-toast {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  background: #1e1b4b;
+  color: #fff;
+  padding: 10px 16px;
+  border-radius: 10px;
+  font-size: 13px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  box-shadow: 0 4px 20px rgba(0,0,0,0.25);
+  z-index: 10000;
+  animation: le-fadein 0.2s ease;
+  max-width: 360px;
+}
+
+.le-toast.le-error {
+  background: #991b1b;
+}
+
+@keyframes le-fadein {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
