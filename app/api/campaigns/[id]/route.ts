@@ -25,6 +25,8 @@ export async function PATCH(
       ...(body.status          !== undefined && { status: body.status }),
       ...(body.name            !== undefined && { name: body.name }),
       ...(body.messageTemplate !== undefined && { messageTemplate: body.messageTemplate }),
+      ...(body.monitorAllPosts !== undefined && { monitorAllPosts: body.monitorAllPosts }),
+      ...(body.autoConnect     !== undefined && { autoConnect: body.autoConnect }),
     },
   });
 

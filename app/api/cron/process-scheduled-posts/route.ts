@@ -12,12 +12,8 @@ import { publishPost } from "@/lib/linkedin-api";
  * Secured with a shared CRON_SECRET header so random callers cannot trigger it.
  *
  * Add to vercel.json:
- * {
- *   "crons": [{
- *     "path": "/api/cron/process-scheduled-posts",
- *     "schedule": "*/10 * * * *"
- *   }]
- * }
+ *   { "crons": [{ "path": "/api/cron/process-scheduled-posts",
+ *     "schedule": "every 10 minutes" }] }
  *
  * Set env var:  CRON_SECRET=<long random string>
  * Vercel automatically sends Authorization: Bearer <CRON_SECRET> for cron invocations.

@@ -24,6 +24,7 @@ export async function POST(req: NextRequest) {
       connectionDegrees = [],
       titleFilter       = "",
       excludeFilter     = "",
+      pagesToScrape     = 3,
     } = await req.json();
     if (!query?.trim())
       return NextResponse.json({ error: "Search query required" }, { status: 400 });
@@ -82,6 +83,7 @@ export async function POST(req: NextRequest) {
       connectionDegrees,
       titleFilter,            // for client-side post-filtering in the extension
       excludeFilter,          // for client-side post-filtering in the extension
+      pagesToScrape: Math.min(Math.max(1, pagesToScrape), 10), // clamp 1-10
     });
     await prisma.$executeRaw`
       INSERT INTO "ExtensionJob" ("id","userId","leadId","type","status","payload","createdAt","updatedAt")

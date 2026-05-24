@@ -127,6 +127,7 @@ export default function SearchPage() {
   const [exclude,            setExclude]            = useState("");
   const [companySizes,       setCompanySizes]       = useState<string[]>([]);
   const [connectionDegrees,  setConnectionDegrees]  = useState<string[]>([]);
+  const [pagesToScrape,      setPagesToScrape]      = useState(3);
 
   // Search state
   const [searching,  setSearching]  = useState(false);
@@ -190,14 +191,11 @@ export default function SearchPage() {
       if (!s) return;
 
       if (s.status === "COMPLETED") {
-        const raw     = (s.results as SearchProfile[]) ?? [];
-        const results = applyFilters(raw);
+        const results = (s.results as SearchProfile[]) ?? [];
         setProfiles(results);
         setTotalFound(results.length);
-        const filtered = raw.length - results.length;
         setStatusMsg(
-          `${results.length} result${results.length !== 1 ? "s" : ""} found` +
-          (filtered > 0 ? ` (${filtered} filtered out by title/exclude)` : "")
+          `${results.length} result${results.length !== 1 ? "s" : ""} found`
         );
         setSearching(false);
         if (pollRef.current) clearInterval(pollRef.current);
@@ -248,6 +246,7 @@ export default function SearchPage() {
           titleFilter:   title.trim(),
           excludeFilter: exclude.trim(),
           connectionDegrees,
+          pagesToScrape,
         }),
       });
 
@@ -446,6 +445,34 @@ export default function SearchPage() {
             </p>
           </div>
         )}
+
+        {/* Pages to scrape */}
+        <div className="space-y-1.5">
+          <div className="flex items-baseline gap-2">
+            <label className="text-xs font-semibold text-gray-700">Pages to Scrape</label>
+            <span className="text-[10px] text-gray-400">~10 results per page</span>
+          </div>
+          <div className="flex flex-wrap gap-1.5">
+            {[1, 2, 3, 5, 10].map(n => {
+              const active = pagesToScrape === n;
+              return (
+                <button
+                  suppressHydrationWarning
+                  key={n}
+                  type="button"
+                  onClick={() => setPagesToScrape(n)}
+                  className={`rounded-full border px-4 py-1 text-xs font-semibold transition-colors ${
+                    active
+                      ? "bg-indigo-600 text-white border-indigo-600"
+                      : "bg-white text-gray-600 border-gray-200 hover:border-indigo-300 hover:text-indigo-600"
+                  }`}
+                >
+                  {n} {n === 1 ? "page" : "pages"} (~{n * 10})
+                </button>
+              );
+            })}
+          </div>
+        </div>
 
         {/* Submit */}
         <button

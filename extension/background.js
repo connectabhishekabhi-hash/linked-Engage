@@ -11,10 +11,12 @@ import { fetchNextJob, completeJob, failJob, getStoredToken } from "./utils/api.
 
 // ── Module-load proof: if you see this in the service worker console the
 //    script parsed and loaded correctly.
-console.log("[bg] background.js module loaded ✓ v15 (bg reads prefs for content script)");
+console.log("[bg] background.js module loaded ✓ v16 (campaign monitoring system)");
 
 const ALARM_NAME = "linkedengage-poll";
+const CAMPAIGN_ALARM_NAME = "linkedengage-campaign-monitor";
 const POLL_INTERVAL_MINUTES = 0.5; // every 30 seconds
+const CAMPAIGN_POLL_MINUTES = 2;   // check campaigns every 2 minutes
 
 // ─── Install / startup ────────────────────────────────────────────────────────
 
@@ -32,10 +34,16 @@ function setupAlarm() {
   chrome.alarms.get(ALARM_NAME, (existing) => {
     if (!existing) {
       chrome.alarms.create(ALARM_NAME, { periodInMinutes: POLL_INTERVAL_MINUTES });
-      console.log("[bg] Alarm created");
+      console.log("[bg] Poll alarm created");
     } else {
-      console.log("[bg] Alarm already exists, next fire in",
+      console.log("[bg] Poll alarm already exists, next fire in",
         Math.round((existing.scheduledTime - Date.now()) / 1000), "s");
+    }
+  });
+  chrome.alarms.get(CAMPAIGN_ALARM_NAME, (existing) => {
+    if (!existing) {
+      chrome.alarms.create(CAMPAIGN_ALARM_NAME, { periodInMinutes: CAMPAIGN_POLL_MINUTES });
+      console.log("[bg] Campaign monitor alarm created");
     }
   });
 }
@@ -44,6 +52,7 @@ function setupAlarm() {
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_NAME) await pollAndProcess();
+  if (alarm.name === CAMPAIGN_ALARM_NAME) await monitorCampaigns();
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -194,51 +203,14 @@ async function processJob(job, auth) {
     }
     case "COMMENT": {
       const activityUrn = job.payload.activityUrn;
-      const objectUrn   = job.payload.objectUrn || activityUrn;
-
-      // ⚠️ Do NOT encodeURIComponent the URN here.
-      // LinkedIn's /feed/update/ page expects literal colons in the URN path,
-      // e.g. /feed/update/urn:li:activity:7457892111758045184
-      // Percent-encoding breaks the redirect and the comment box never appears.
       const targetUrl = job.payload.targetUrl ||
         (activityUrn ? `https://www.linkedin.com/feed/update/${activityUrn}` : "");
 
-      let myUrn = "";
-      try {
-        myUrn = await runInLinkedInTab("getMyProfile", [auth.csrfToken]);
-      } catch (profileErr) {
-        console.warn("[bg] Could not resolve my LinkedIn URN:", profileErr.message);
-      }
+      if (!targetUrl) throw new Error("No post URL — re-scrape this lead.");
 
-      console.log("[bg] COMMENT — myUrn:", myUrn,
-        "activityUrn:", activityUrn, "objectUrn:", objectUrn,
-        "targetUrl:", targetUrl);
-
-      if (!activityUrn && !objectUrn)
-        throw new Error("No post URN in job payload — re-scrape this lead.");
-
-      let commentPosted = false;
-
-      // ── Attempt 1: Voyager API ─────────────────────────────────────────────
-      if (myUrn) {
-        try {
-          await runInLinkedInTab("postComment",
-            [activityUrn, objectUrn, myUrn, job.payload.commentText, auth.csrfToken]);
-          commentPosted = true;
-          console.log("[bg] COMMENT — Voyager API succeeded");
-        } catch (apiErr) {
-          // Log the FULL error (not truncated) so we can see the HTTP status
-          console.warn("[bg] COMMENT — Voyager API failed (full error):", apiErr.message);
-        }
-      }
-
-      // ── Attempt 2: Page fallback (DOM automation) ──────────────────────────
-      if (!commentPosted) {
-        console.log("[bg] COMMENT — trying page fallback, url:", targetUrl);
-        await postCommentViaPage(targetUrl, job.payload.commentText);
-        commentPosted = true;
-        console.log("[bg] COMMENT — page fallback succeeded");
-      }
+      console.log("[bg] COMMENT — DOM-only, url:", targetUrl);
+      await postCommentViaPage(targetUrl, job.payload.commentText);
+      console.log("[bg] COMMENT — posted ✓");
 
       await completeJob(job.id, { posted: true });
       break;
@@ -252,65 +224,107 @@ async function processJob(job, auth) {
         searchId,
         titleFilter   = "",  // for client-side post-filtering only
         excludeFilter = "",  // for client-side post-filtering only
+        pagesToScrape = 1,   // how many LinkedIn pages to scrape (1-10)
       } = job.payload;
 
       // ── Validate we have a URL to open ────────────────────────────────────
-      // searchUrl is built server-side by lib/buildSearchUrl.ts, which maps
-      // each filter to its own URL param (title=, company=, keywords=, network=).
-      // If it's missing (old job), fall back gracefully to a keyword search.
-      const targetUrl = searchUrl?.trim()
+      const baseUrl = searchUrl?.trim()
         ? searchUrl.trim()
         : `https://www.linkedin.com/search/results/people/?origin=GLOBAL_SEARCH_HEADER&keywords=${encodeURIComponent(query.trim())}`;
 
-      if (!targetUrl.includes("linkedin.com/search")) {
+      if (!baseUrl.includes("linkedin.com/search")) {
         throw new Error("Invalid or missing LinkedIn search URL in job payload");
       }
 
-      await setStatus(`🔍 Searching LinkedIn…`);
-      console.log(`[bg] SEARCH v9 — opening URL: ${targetUrl.slice(0, 120)}`);
+      const totalPages = Math.min(Math.max(1, pagesToScrape), 10);
+      await setStatus(`🔍 Searching LinkedIn (${totalPages} page${totalPages > 1 ? "s" : ""})…`);
+      console.log(`[bg] SEARCH v10 — ${totalPages} pages — base URL: ${baseUrl.slice(0, 120)}`);
 
-      let profiles = [], total = 0, hasMore = false;
+      let allProfiles = [];
       let searchTab;
+
       try {
-        // ── Open the pre-built LinkedIn search URL ────────────────────────
-        // Each filter is already a separate URL param — no merging needed here.
-        searchTab = await chrome.tabs.create({ url: targetUrl, active: true });
-        console.log(`[bg] SEARCH tab created: ${searchTab.id}`);
+        for (let page = 1; page <= totalPages; page++) {
+          // Build page URL — LinkedIn uses &page=N for pagination
+          const pageUrl = page === 1 ? baseUrl : (() => {
+            const u = new URL(baseUrl);
+            u.searchParams.set("page", String(page));
+            return u.toString();
+          })();
 
-        await waitForTabLoad(searchTab.id);
-        // Buffer for LinkedIn's React hydration to complete
-        await new Promise(r => setTimeout(r, 2000));
+          await setStatus(`🔍 Scraping page ${page}/${totalPages}… (${allProfiles.length} found so far)`);
+          console.log(`[bg] SEARCH page ${page}/${totalPages}: ${pageUrl.slice(0, 120)}`);
 
-        const results = await chrome.scripting.executeScript({
-          target: { tabId: searchTab.id },
-          func:   extractSearchResults,
-          args:   ["", start, count, auth.csrfToken],
-        });
+          if (page === 1) {
+            // First page: create the tab
+            searchTab = await chrome.tabs.create({ url: pageUrl, active: true });
+            console.log(`[bg] SEARCH tab created: ${searchTab.id}`);
+          } else {
+            // Subsequent pages: navigate the same tab
+            await chrome.tabs.update(searchTab.id, { url: pageUrl });
+          }
 
-        const data = results?.[0]?.result ?? {};
-        if (data?.error) throw new Error(data.error);
+          await waitForTabLoad(searchTab.id);
+          // Buffer for LinkedIn's React hydration
+          await new Promise(r => setTimeout(r, 3000));
 
-        let rawProfiles = data.profiles ?? [];
-        total   = data.total   ?? rawProfiles.length;
-        hasMore = data.hasMore ?? false;
-        console.log(`[bg] SEARCH raw: ${rawProfiles.length} profiles from DOM`);
-        if (data.debug?.length) console.log("[bg] SEARCH debug:", data.debug.join(" | "));
+          const results = await chrome.scripting.executeScript({
+            target: { tabId: searchTab.id },
+            func:   extractSearchResults,
+            args:   ["", 0, 100, auth.csrfToken],
+          });
 
-        // ── Smart client-side post-filter ─────────────────────────────────
-        // Runs after LinkedIn's own URL filters (title=, keywords=, network=).
-        // Three layers: Open-to-Work drop → exclude terms → title validation.
-        const beforeFilter = rawProfiles.length;
-        rawProfiles = sanitizeProfiles(rawProfiles, { titleFilter, excludeFilter });
-        console.log(`[bg] SEARCH sanitize: ${beforeFilter} → ${rawProfiles.length} profiles`);
+          const data = results?.[0]?.result ?? {};
+          if (data?.error) {
+            console.warn(`[bg] SEARCH page ${page} error:`, data.error);
+            break; // Stop pagination on error
+          }
 
-        profiles = rawProfiles;
-        total    = profiles.length;
+          const pageProfiles = data.profiles ?? [];
+          console.log(`[bg] SEARCH page ${page}: ${pageProfiles.length} profiles`);
+          if (data.debug?.length) console.log("[bg] SEARCH p${page} debug:", data.debug.join(" | "));
+
+          if (pageProfiles.length === 0) {
+            console.log(`[bg] SEARCH page ${page}: no results — stopping pagination`);
+            break; // No more results
+          }
+
+          // Deduplicate: only add profiles we haven't seen
+          const existingUrls = new Set(allProfiles.map(p => p.profileUrl));
+          for (const p of pageProfiles) {
+            if (!existingUrls.has(p.profileUrl)) {
+              allProfiles.push(p);
+              existingUrls.add(p.profileUrl);
+            }
+          }
+
+          console.log(`[bg] SEARCH after page ${page}: ${allProfiles.length} total unique profiles`);
+
+          // Rate limit between pages (2-4s random delay)
+          if (page < totalPages) {
+            const delay = 2000 + Math.random() * 2000;
+            await new Promise(r => setTimeout(r, delay));
+          }
+        }
       } finally {
         if (searchTab?.id) chrome.tabs.remove(searchTab.id).catch(() => {});
       }
 
-      console.log(`[bg] SEARCH v9 complete: ${profiles.length} profiles`);
-      await completeJob(job.id, { profiles, total, hasMore, searchId });
+      // ── Client-side exclude filter only (no title re-filtering) ────────
+      // LinkedIn already applies title= server-side, so we only drop
+      // profiles matching user-specified exclude terms.
+      if (excludeFilter?.trim()) {
+        const beforeFilter = allProfiles.length;
+        const excludeTerms = excludeFilter.split(",").map(t => t.trim().toLowerCase()).filter(Boolean);
+        allProfiles = allProfiles.filter(p => {
+          const haystack = `${p.fullName} ${p.headline}`.toLowerCase();
+          return !excludeTerms.some(term => haystack.includes(term));
+        });
+        console.log(`[bg] SEARCH exclude filter: ${beforeFilter} → ${allProfiles.length} profiles`);
+      }
+
+      console.log(`[bg] SEARCH v10 complete: ${allProfiles.length} profiles from ${totalPages} pages`);
+      await completeJob(job.id, { profiles: allProfiles, total: allProfiles.length, hasMore: false, searchId });
       break;
     }
 
@@ -460,7 +474,7 @@ async function extractPostsFromPage(csrfToken, vanityName, knownProfileUrn) {
     const { activityUrn, shareUrn } = extractUrns(u);
     const urn = activityUrn || shareUrn;
     if (text.length > 10 && urn && !posts.some(p => p.activityUrn === urn)) {
-      posts.push({ text, activityUrn: urn, shareUrn, url: `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}` });
+      posts.push({ text, activityUrn: urn, shareUrn, url: `https://www.linkedin.com/feed/update/${urn}` });
       debug.push(`post[${posts.length - 1}] from=${source} activity=${activityUrn.slice(-15)} share=${shareUrn.slice(-15)}`);
       return true;
     }
@@ -560,7 +574,7 @@ async function extractPostsFromPage(csrfToken, vanityName, knownProfileUrn) {
         // Pick the longest text — most likely the post body
         const text = texts.sort((a, b) => b.length - a.length)[0] ?? "";
         if (text.length > 30 && !posts.some(p => p.activityUrn === urn)) {
-          posts.push({ text, activityUrn: urn, url: `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}` });
+          posts.push({ text, activityUrn: urn, url: `https://www.linkedin.com/feed/update/${urn}` });
           debug.push(`DOM post[${posts.length - 1}] urn=${urn.slice(-20)} text="${text.slice(0, 40)}"`);
         }
       }
@@ -578,7 +592,7 @@ async function extractPostsFromPage(csrfToken, vanityName, knownProfileUrn) {
       // We found URNs in the HTML but can't get text reliably — record at least that posts exist
       for (const urn of uniqueUrns.slice(0, 3)) {
         if (posts.length >= 3) break;
-        posts.push({ text: "[Post found — text extraction failed]", activityUrn: urn, url: `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}` });
+        posts.push({ text: "[Post found — text extraction failed]", activityUrn: urn, url: `https://www.linkedin.com/feed/update/${urn}` });
         debug.push(`fallback urn: ${urn}`);
       }
     } catch (e) { debug.push(`urn scan error: ${e.message}`); }
@@ -658,14 +672,20 @@ function sanitizeProfiles(profiles, { titleFilter = "", excludeFilter = "" } = {
       }
     }
 
-    // ── Layer 3: Title validation ──────────────────────────────────────────
-    // Strict mode: if a title filter is set, we ONLY keep profiles whose
-    // headline explicitly contains the keyword.  Blank-headline profiles are
-    // now DROPPED — letting them pass was the main source of false positives
-    // (LinkedIn matched them on some other field like a skill or past role).
+    // ── Layer 3: Title validation (lenient) ──────────────────────────────
+    // LinkedIn's own title= URL param already filters by title server-side.
+    // DOM headline extraction is unreliable (often returns location/degree
+    // text instead of job title), so we only drop profiles whose headline
+    // is non-empty AND clearly doesn't match. Blank headlines pass through
+    // since the extraction likely failed, not because the title is wrong.
     if (titleRegex) {
-      if (!headline.trim() || !titleRegex.test(headline)) {
-        return false;
+      if (headline.trim() && !titleRegex.test(headline)) {
+        // Headline exists but doesn't match — still check fullName + summary
+        // in case the title appears there (e.g. "John Doe - Founder")
+        const combined = `${fullName} ${summary}`;
+        if (!titleRegex.test(combined)) {
+          return false;
+        }
       }
     }
 
@@ -757,14 +777,16 @@ async function extractSearchResults(query, start, wantCount, csrfToken) {
     });
 
     // Scroll down to trigger LinkedIn's lazy-load for more results.
-    // LinkedIn shows 10 per "page" but loads more as you scroll.
-    // We do 3 incremental scrolls with small delays (MutationObserver already
-    // confirmed the page is hydrated, so these scrolls are safe).
+    // LinkedIn shows ~10 per "page" but loads more as you scroll.
+    // We do 6 incremental scrolls to ensure all results on the page are loaded.
     try {
-      for (let i = 1; i <= 3; i++) {
-        window.scrollTo({ top: document.body.scrollHeight * (i / 3), behavior: "smooth" });
-        await new Promise(r => setTimeout(r, 1200));
+      for (let i = 1; i <= 6; i++) {
+        window.scrollTo({ top: document.body.scrollHeight * (i / 6), behavior: "smooth" });
+        await new Promise(r => setTimeout(r, 800));
       }
+      // Scroll all the way to bottom once more to trigger any remaining lazy loads
+      window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      await new Promise(r => setTimeout(r, 1500));
       // Scroll back to top so MiniProfile blobs at the top are still parseable
       window.scrollTo({ top: 0, behavior: "instant" });
       await new Promise(r => setTimeout(r, 500));
@@ -847,7 +869,11 @@ async function extractSearchResults(query, start, wantCount, csrfToken) {
 
         // primarySubtitle = current role/company ("Founder at Acme")
         // secondarySubtitle = location or degree indicator
-        const headline = item.primarySubtitle?.text ?? item.secondarySubtitle?.text ?? "";
+        // headline / occupation = fallback from other blob formats
+        const headline = item.primarySubtitle?.text
+                      ?? item.headline?.text ?? item.headline
+                      ?? item.occupation
+                      ?? item.secondarySubtitle?.text ?? "";
 
         // summary / caption = LinkedIn's snippet explaining WHY this person matched.
         // When the match is based on a past role it reads "Past: Founder at XYZ".
@@ -1387,7 +1413,7 @@ async function executeVoyagerCall(fnName, args) {
             text,
             activityUrn: urn,
             shareUrn,   // ← ugcPost URN for official LinkedIn API
-            url: `https://www.linkedin.com/feed/update/${encodeURIComponent(urn)}`,
+            url: `https://www.linkedin.com/feed/update/${urn}`,
           });
         }
       }
@@ -1472,6 +1498,46 @@ async function executeVoyagerCall(fnName, args) {
         ...(note?.trim() ? { customMessage: note.trim().slice(0, 300) } : {}),
       });
       return { data: result };
+    }
+
+    // ── getMyVanityName — get the current user's LinkedIn vanity name ───────
+    if (fnName === "getMyVanityName") {
+      try {
+        const meRaw = await get("/identity/dash/profiles?q=memberIdentity&memberIdentity=me");
+        const meIncluded = meRaw?.included ?? [];
+        const meProfile =
+          meIncluded.find(i => i?.publicIdentifier && i?.firstName) ??
+          meIncluded.find(i => i?.publicIdentifier) ??
+          {};
+        const vanity = meProfile?.publicIdentifier ?? "";
+        if (!vanity) throw new Error("No publicIdentifier in /me response");
+        console.log("[getMyVanityName] resolved:", vanity);
+        return { data: vanity };
+      } catch (e1) {
+        // Fallback: /me endpoint
+        try {
+          const raw = await get("/me");
+          const included = raw?.included ?? [];
+          const mini = included.find(i => i?.publicIdentifier) ?? {};
+          const vanity = mini?.publicIdentifier ?? raw?.data?.publicIdentifier ?? "";
+          if (vanity) return { data: vanity };
+        } catch (_) {}
+        throw new Error("Could not resolve vanity name: " + e1.message);
+      }
+    }
+
+    // ── getProfileUrn — resolve a vanity name to a profile URN ─────────────
+    if (fnName === "getProfileUrn") {
+      const vanityName = args[0];
+      const raw = await get(`/identity/dash/profiles?q=memberIdentity&memberIdentity=${encodeURIComponent(vanityName)}`);
+      const included = raw?.included ?? [];
+      const profile =
+        included.find(i => i?.entityUrn?.includes("fsd_profile") && i?.firstName) ??
+        included.find(i => i?.firstName && i?.entityUrn) ??
+        {};
+      const urn = profile?.entityUrn ?? "";
+      if (!urn) throw new Error(`Could not resolve URN for ${vanityName}`);
+      return { data: urn };
     }
 
     // ── postComment ────────────────────────────────────────────────────────
@@ -2083,4 +2149,534 @@ async function postCommentFromLinkedInPage(commentText) {
 
 async function setStatus(text) {
   await chrome.storage.local.set({ status: text, statusAt: Date.now() });
+}
+
+// ─── Campaign Monitoring System ──────────────────────────────────────────────
+// Periodically fetches active campaigns from the backend, opens each target
+// post in a tab, scrapes comments, matches trigger keywords, and sends
+// connection requests with the templated message.
+
+let campaignMonitorRunning = false;
+
+async function monitorCampaigns() {
+  if (campaignMonitorRunning) {
+    console.log("[campaign] Monitor already running, skipping");
+    return;
+  }
+  campaignMonitorRunning = true;
+
+  try {
+    const token = await getStoredToken();
+    if (!token) { console.log("[campaign] No token — skipping"); return; }
+
+    const auth = await getLinkedInAuth();
+    if (!auth) { console.log("[campaign] No LinkedIn auth — skipping"); return; }
+
+    // Fetch active campaigns from backend
+    const BACKEND = "http://localhost:3000";
+    const res = await fetch(`${BACKEND}/api/extension/campaigns`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) { console.warn("[campaign] Failed to fetch campaigns:", res.status); return; }
+
+    const { campaigns } = await res.json();
+    if (!campaigns?.length) { console.log("[campaign] No active campaigns"); return; }
+
+    console.log(`[campaign] Found ${campaigns.length} active campaign(s)`);
+
+    // Load already-processed commenters to avoid duplicates
+    const { campaignProcessed = {} } = await chrome.storage.local.get("campaignProcessed");
+
+    for (const campaign of campaigns) {
+      try {
+        await processCampaign(campaign, auth, token, campaignProcessed);
+      } catch (e) {
+        console.error(`[campaign] Error processing "${campaign.name}":`, e.message);
+      }
+
+      // Rate limit: wait 10s between campaigns to avoid LinkedIn detection
+      if (campaigns.indexOf(campaign) < campaigns.length - 1) {
+        await new Promise(r => setTimeout(r, 10000));
+      }
+    }
+
+    // Save updated processed set
+    await chrome.storage.local.set({ campaignProcessed });
+  } catch (e) {
+    console.error("[campaign] Monitor error:", e.message);
+  } finally {
+    campaignMonitorRunning = false;
+  }
+}
+
+async function processCampaign(campaign, auth, token, processedMap) {
+  const { id, name, targetPostUrl, triggerKeyword, messageTemplate, monitorAllPosts, autoConnect } = campaign;
+  console.log(`[campaign] Processing "${name}" — keyword: "${triggerKeyword || "ANY"}" — monitorAll: ${monitorAllPosts} — autoConnect: ${autoConnect}`);
+
+  // Initialize processed set for this campaign
+  if (!processedMap[id]) processedMap[id] = [];
+  const alreadyProcessed = new Set(processedMap[id]);
+
+  // Determine which post URLs to monitor
+  let postUrls = [];
+
+  if (monitorAllPosts) {
+    // Auto-discover user's posts via Voyager API
+    try {
+      const myPosts = await fetchMyRecentPosts(auth);
+      postUrls = myPosts.map(p => p.url).filter(Boolean);
+      console.log(`[campaign] "${name}" — discovered ${postUrls.length} posts to monitor`);
+    } catch (e) {
+      console.error(`[campaign] "${name}" — failed to fetch posts:`, e.message);
+      return;
+    }
+  } else if (targetPostUrl) {
+    postUrls = [targetPostUrl];
+  } else {
+    console.warn(`[campaign] "${name}" — no target URL and monitorAllPosts=false, skipping`);
+    return;
+  }
+
+  if (postUrls.length === 0) {
+    console.log(`[campaign] "${name}" — no posts found to monitor`);
+    return;
+  }
+
+  // Limit to 10 most recent posts to avoid excessive scraping
+  const postsToMonitor = postUrls.slice(0, 10);
+
+  for (const postUrl of postsToMonitor) {
+    try {
+      await scrapeAndProcessPostComments({
+        postUrl,
+        campaign: { id, name, triggerKeyword, messageTemplate, autoConnect },
+        auth,
+        token,
+        alreadyProcessed,
+        processedMap,
+      });
+    } catch (e) {
+      console.error(`[campaign] "${name}" — error on post ${postUrl.slice(0, 60)}:`, e.message);
+    }
+
+    // Rate limit between posts: 5s
+    if (postsToMonitor.indexOf(postUrl) < postsToMonitor.length - 1) {
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
+}
+
+/**
+ * fetchMyRecentPosts — gets the current user's own LinkedIn posts via Voyager API.
+ * Returns [{ url, activityUrn }] for up to 10 recent posts.
+ */
+async function fetchMyRecentPosts(auth) {
+  const posts = [];
+
+  try {
+    // Strategy 1: Open user's own recent-activity page
+    // First, get the user's own vanity name
+    let myVanity = "";
+    try {
+      const profileData = await runInLinkedInTab("getMyVanityName", [auth.csrfToken]);
+      myVanity = profileData || "";
+    } catch (e) {
+      console.warn("[campaign] Could not get my vanity name:", e.message);
+    }
+
+    if (!myVanity) {
+      console.warn("[campaign] No vanity name — cannot fetch posts");
+      return posts;
+    }
+
+    console.log(`[campaign] Fetching posts for ${myVanity}`);
+
+    // Open the recent-activity page
+    const activityUrl = `https://www.linkedin.com/in/${encodeURIComponent(myVanity)}/recent-activity/all/`;
+    let activityTab;
+    try {
+      activityTab = await chrome.tabs.create({ url: activityUrl, active: false });
+      await waitForTabLoad(activityTab.id);
+      await new Promise(r => setTimeout(r, 5000));
+
+      // Extract post URLs from the page
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: activityTab.id },
+        func: extractMyPostUrls,
+      });
+
+      const data = results?.[0]?.result ?? [];
+      for (const p of data) {
+        if (p.url && posts.length < 10) {
+          posts.push(p);
+        }
+      }
+      console.log(`[campaign] Found ${posts.length} of my posts from activity page`);
+    } finally {
+      if (activityTab?.id) chrome.tabs.remove(activityTab.id).catch(() => {});
+    }
+  } catch (e) {
+    console.error("[campaign] fetchMyRecentPosts error:", e.message);
+  }
+
+  return posts;
+}
+
+/**
+ * extractMyPostUrls — injected into the user's recent-activity page.
+ * Returns [{ url, activityUrn }] for all visible posts.
+ */
+function extractMyPostUrls() {
+  const posts = [];
+  const seen = new Set();
+
+  try {
+    // Strategy 1: Find activity URNs from data-urn attributes
+    const urnElements = document.querySelectorAll("[data-urn]");
+    for (const el of urnElements) {
+      const rawUrn = el.getAttribute("data-urn") || "";
+      if (!rawUrn.includes("activity") && !rawUrn.includes("ugcPost")) continue;
+
+      // Clean the URN
+      let urn = "";
+      let m = rawUrn.match(/urn:li:activity:(\d+)/);
+      if (m) urn = `urn:li:activity:${m[1]}`;
+      if (!urn) {
+        m = rawUrn.match(/urn:li:ugcPost:(\d+)/);
+        if (m) urn = `urn:li:ugcPost:${m[1]}`;
+      }
+      if (!urn || seen.has(urn)) continue;
+      seen.add(urn);
+      posts.push({
+        url: `https://www.linkedin.com/feed/update/${urn}`,
+        activityUrn: urn,
+      });
+    }
+
+    // Strategy 2: Find links that contain activity URNs
+    if (posts.length === 0) {
+      const links = document.querySelectorAll('a[href*="feed/update/"]');
+      for (const link of links) {
+        const href = link.getAttribute("href") || "";
+        let m = href.match(/urn:li:activity:(\d+)/);
+        if (!m) m = href.match(/urn:li:ugcPost:(\d+)/);
+        if (!m) continue;
+        const urn = m[0];
+        if (seen.has(urn)) continue;
+        seen.add(urn);
+        posts.push({
+          url: `https://www.linkedin.com/feed/update/${urn}`,
+          activityUrn: urn,
+        });
+      }
+    }
+
+    // Strategy 3: Scan HTML for any activity URNs
+    if (posts.length === 0) {
+      const allText = document.body.innerHTML;
+      const urnMatches = [...allText.matchAll(/urn:li:activity:(\d+)/g)];
+      const uniqueUrns = [...new Set(urnMatches.map(m => `urn:li:activity:${m[1]}`))];
+      for (const urn of uniqueUrns.slice(0, 10)) {
+        if (seen.has(urn)) continue;
+        seen.add(urn);
+        posts.push({
+          url: `https://www.linkedin.com/feed/update/${urn}`,
+          activityUrn: urn,
+        });
+      }
+    }
+  } catch (e) {
+    console.error("[extractMyPostUrls] Error:", e.message);
+  }
+
+  return posts.slice(0, 10);
+}
+
+/**
+ * scrapeAndProcessPostComments — opens a single post, extracts comments,
+ * matches against campaign triggers, and sends connection requests.
+ */
+async function scrapeAndProcessPostComments({ postUrl, campaign, auth, token, alreadyProcessed, processedMap }) {
+  const { id, name, triggerKeyword, messageTemplate, autoConnect } = campaign;
+
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url: postUrl, active: false });
+    await waitForTabLoad(tab.id);
+    // Wait for LinkedIn's SPA to render comments
+    await new Promise(r => setTimeout(r, 6000));
+
+    // Scroll down to load more comments
+    await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: () => {
+        // Click "Load more comments" buttons if present
+        const loadMoreBtns = document.querySelectorAll('button[aria-label*="comment"], button[aria-label*="Comment"]');
+        for (const btn of loadMoreBtns) {
+          const text = (btn.textContent || "").toLowerCase();
+          if (text.includes("load") || text.includes("more") || text.includes("previous")) {
+            btn.click();
+          }
+        }
+        window.scrollTo({ top: document.body.scrollHeight, behavior: "smooth" });
+      },
+    });
+
+    await new Promise(r => setTimeout(r, 3000));
+
+    // Extract comments from the page
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: extractCommentsFromPost,
+      args: [auth.csrfToken],
+    });
+
+    const data = results?.[0]?.result ?? { comments: [], debug: [] };
+    const comments = data.comments ?? [];
+    console.log(`[campaign] "${name}" — post ${postUrl.slice(-30)} — ${comments.length} comments. Debug: ${(data.debug ?? []).join(" | ")}`);
+
+    if (comments.length === 0) return;
+
+    // Filter comments based on campaign mode
+    let matchedComments;
+    if (autoConnect) {
+      // Auto-connect mode: match ALL commenters (skip already processed)
+      matchedComments = comments.filter(c => !alreadyProcessed.has(c.profileUrl));
+      console.log(`[campaign] "${name}" — ${matchedComments.length} new commenters (auto-connect)`);
+    } else if (triggerKeyword) {
+      // Keyword mode: only match comments containing the trigger keyword
+      const keyword = triggerKeyword.toUpperCase();
+      matchedComments = comments.filter(c => {
+        const text = (c.commentText || "").toUpperCase();
+        return text.includes(keyword) && !alreadyProcessed.has(c.profileUrl);
+      });
+      console.log(`[campaign] "${name}" — ${matchedComments.length} new keyword matches`);
+    } else {
+      console.log(`[campaign] "${name}" — no trigger mode configured, skipping`);
+      return;
+    }
+
+    // Send connection requests for matched commenters
+    for (const match of matchedComments) {
+      try {
+        // Build personalized message
+        const firstName = (match.commenterName || "").split(" ")[0] || "there";
+        let note = "";
+        if (messageTemplate) {
+          note = messageTemplate
+            .replace(/\{\{firstName\}\}/gi, firstName)
+            .replace(/\{\{name\}\}/gi, match.commenterName || "there")
+            .slice(0, 300); // LinkedIn limits connection notes to 300 chars
+        }
+
+        console.log(`[campaign] "${name}" — sending connection to ${match.commenterName} (${match.profileUrl})${note ? " with note" : " without note"}`);
+
+        // Extract vanityName from the profile URL
+        const vanityMatch = match.profileUrl.match(/\/in\/([^/?#]+)/);
+        const vanityName = vanityMatch ? vanityMatch[1] : "";
+
+        if (!vanityName) {
+          console.warn(`[campaign] Could not extract vanity name from ${match.profileUrl}`);
+          continue;
+        }
+
+        // Get the profile URN via Voyager API
+        let profileUrn = match.profileUrn || "";
+        if (!profileUrn) {
+          try {
+            profileUrn = await runInLinkedInTab("getProfileUrn", [vanityName, auth.csrfToken]);
+          } catch (e) {
+            console.warn(`[campaign] Could not resolve URN for ${vanityName}:`, e.message);
+          }
+        }
+
+        if (!profileUrn) {
+          console.warn(`[campaign] No profileUrn for ${vanityName} — skipping`);
+          continue;
+        }
+
+        // Send the connection request (with or without note)
+        await runInLinkedInTab("sendConnectionRequest", [profileUrn, note || "", auth.csrfToken]);
+        console.log(`[campaign] "${name}" — connection sent to ${match.commenterName} ✓`);
+
+        // Mark as processed
+        alreadyProcessed.add(match.profileUrl);
+        processedMap[id].push(match.profileUrl);
+
+        // Report to backend
+        const BACKEND = "http://localhost:3000";
+        await fetch(`${BACKEND}/api/extension/campaigns/${id}/triggered`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            commenterName: match.commenterName,
+            commenterProfileUrl: match.profileUrl,
+            commentText: match.commentText,
+          }),
+        }).catch(e => console.warn("[campaign] Failed to report trigger:", e.message));
+
+        // Rate limit: wait 15-30s between connection requests
+        const delay = 15000 + Math.random() * 15000;
+        console.log(`[campaign] Rate limiting — waiting ${Math.round(delay / 1000)}s`);
+        await new Promise(r => setTimeout(r, delay));
+      } catch (e) {
+        console.error(`[campaign] Failed to process ${match.commenterName}:`, e.message);
+      }
+    }
+  } finally {
+    if (tab?.id) chrome.tabs.remove(tab.id).catch(() => {});
+  }
+}
+
+/**
+ * extractCommentsFromPost — injected into a LinkedIn post page.
+ * Scrapes all visible comments and returns commenter info.
+ * Returns { comments: [{commenterName, profileUrl, profileUrn, commentText}], debug: string[] }
+ */
+function extractCommentsFromPost(csrfToken) {
+  const comments = [];
+  const debug = [];
+  const seen = new Set();
+
+  try {
+    debug.push(`url=${window.location.href.slice(0, 80)}`);
+
+    // ── Strategy 1: Voyager API — fetch comments via LinkedIn's API ──────────
+    // This is the most reliable approach but may not always work
+    // We'll try DOM extraction as our primary strategy since it's simpler
+
+    // ── Strategy 2: DOM extraction ──────────────────────────────────────────
+    // LinkedIn comment sections use various structures. We look for:
+    // 1. Profile links inside comment containers
+    // 2. Comment text near those profile links
+
+    // Find all profile links in the comments section
+    const allProfileLinks = document.querySelectorAll('a[href*="/in/"]');
+    debug.push(`profileLinks=${allProfileLinks.length}`);
+
+    for (const link of allProfileLinks) {
+      const href = link.getAttribute("href") || "";
+      const profileMatch = href.match(/\/in\/([^/?#]+)/);
+      if (!profileMatch) continue;
+
+      const vanityName = profileMatch[1];
+      const profileUrl = `https://www.linkedin.com/in/${vanityName}/`;
+
+      // Skip if we've already processed this profile on this page
+      if (seen.has(profileUrl)) continue;
+
+      // Walk up to find the comment container
+      // Comments are typically in <article> or specific divs
+      let commentContainer = null;
+      let node = link.parentElement;
+      for (let i = 0; i < 10 && node; i++) {
+        // Look for article elements or divs that look like comment containers
+        if (node.tagName === "ARTICLE") {
+          commentContainer = node;
+          break;
+        }
+        // LinkedIn wraps comments in divs with specific data attributes
+        if (node.getAttribute("data-id") || node.getAttribute("data-urn")) {
+          commentContainer = node;
+          break;
+        }
+        // Look for comment-like containers (have both a profile link and text content)
+        if (node.tagName === "DIV" || node.tagName === "LI") {
+          const hasText = node.querySelectorAll("span, p").length > 2;
+          const hasProfile = node.querySelector('a[href*="/in/"]');
+          if (hasText && hasProfile && node.textContent.length > 50) {
+            commentContainer = node;
+            break;
+          }
+        }
+        node = node.parentElement;
+      }
+
+      if (!commentContainer) continue;
+
+      // Extract commenter name from the link
+      let commenterName = "";
+      // Try aria-label first
+      const ariaLabel = link.getAttribute("aria-label") || "";
+      if (ariaLabel) {
+        commenterName = ariaLabel
+          .replace(/^View\s+/i, "")
+          .replace(/[''`']s\s+profile\s*$/i, "")
+          .replace(/[''`']s\s+comment\s*$/i, "")
+          .trim();
+      }
+      // Fallback: text content of the link
+      if (!commenterName || commenterName.length < 2) {
+        const spans = link.querySelectorAll('span[aria-hidden="true"]');
+        for (const s of spans) {
+          const t = (s.textContent || "").trim();
+          if (t.length >= 2 && t.length <= 80 && !t.match(/^(View|Connect|Follow|Message|1st|2nd|3rd)/i)) {
+            commenterName = t;
+            break;
+          }
+        }
+      }
+      if (!commenterName || commenterName.length < 2) {
+        commenterName = (link.textContent || "").trim().slice(0, 80);
+      }
+
+      // Skip if name looks like a UI element, not a person
+      if (!commenterName || commenterName.length < 2) continue;
+      if (/^(View|Connect|Follow|Message|Like|Reply|Comment|Share|Report|Load|Show)/i.test(commenterName)) continue;
+
+      // Extract comment text from the container
+      let commentText = "";
+
+      // Look for the actual comment text — usually in spans or paragraphs
+      // inside the container, but NOT inside nested profile link areas
+      const textElements = commentContainer.querySelectorAll("span, p");
+      let longestText = "";
+      for (const el of textElements) {
+        // Skip if this element is inside a profile link
+        if (el.closest('a[href*="/in/"]')) continue;
+        // Skip UI elements
+        const t = (el.textContent || "").trim();
+        if (t.length < 2) continue;
+        if (/^(Like|Reply|Comment|Share|Report|reactions?|View|Connect|Follow)/i.test(t)) continue;
+        if (/^\d+\s*(like|comment|repost|reaction)/i.test(t)) continue;
+        // The longest non-UI text is likely the comment
+        if (t.length > longestText.length) {
+          longestText = t;
+        }
+      }
+      commentText = longestText;
+
+      // Only add if we have a meaningful comment text
+      if (commentText.length < 2) continue;
+
+      seen.add(profileUrl);
+      comments.push({
+        commenterName: commenterName.trim(),
+        profileUrl,
+        profileUrn: "", // Will be resolved later if needed
+        commentText: commentText.slice(0, 500),
+      });
+    }
+
+    debug.push(`comments_extracted=${comments.length}`);
+
+    // ── Strategy 3: Voyager API fallback for getting comments ────────────────
+    // If DOM extraction found few/no comments, we can try the API
+    // But this requires knowing the post URN
+    if (comments.length === 0) {
+      debug.push("no_dom_comments_trying_urn_scan");
+      // Try to find the post URN from the URL or page
+      const urlMatch = window.location.href.match(/urn:li:(?:activity|ugcPost):(\d+)/);
+      const urnFromUrl = urlMatch ? `urn:li:activity:${urlMatch[1]}` : "";
+      debug.push(`urn_from_url=${urnFromUrl || "none"}`);
+    }
+  } catch (e) {
+    debug.push(`error: ${e.message}`);
+  }
+
+  debug.push(`FINAL: ${comments.length} comments`);
+  return { comments, debug };
 }

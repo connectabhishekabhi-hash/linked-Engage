@@ -73,7 +73,7 @@ export async function POST(req: NextRequest) {
     const objectUrn = matchedPost?.shareUrn || resolvedUrn;
     const postUrl = matchedPost?.url ||
       targetUrl ||
-      (activityUrn ? `https://www.linkedin.com/feed/update/${encodeURIComponent(activityUrn)}` : "");
+      (activityUrn ? `https://www.linkedin.com/feed/update/${activityUrn}` : "");
 
     // ── Try official LinkedIn API first (no extension needed) ──────────────
     // Use `as any` so this works even before `prisma generate` is re-run

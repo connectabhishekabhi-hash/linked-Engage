@@ -86,7 +86,7 @@ export async function POST() {
           create: {
             userId,
             postUrn,
-            postUrl:     `https://www.linkedin.com/feed/update/${encodeURIComponent(postUrn)}/`,
+            postUrl:     `https://www.linkedin.com/feed/update/${postUrn}/`,
             postPreview: sp.content.slice(0, 280),
             viewerData,
             fetchedAt:   new Date(),

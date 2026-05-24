@@ -4,7 +4,6 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
 }
 
 model User {
@@ -34,11 +33,13 @@ model Campaign {
   userId          String
   user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
   name            String
-  targetPostUrl   String         // LinkedIn post to monitor for keyword comments
-  triggerKeyword  String         // e.g. "SEND", "DM ME"
-  messageTemplate String         @db.Text  // DM/connection note to send
+  targetPostUrl   String?        // LinkedIn post to monitor (optional when monitorAllPosts=true)
+  triggerKeyword  String?        // e.g. "SEND", "DM ME" (optional when autoConnect=true)
+  messageTemplate String?        @db.Text  // DM/connection note to send (optional)
   status          CampaignStatus @default(ACTIVE)
   leadsTriggered  Int            @default(0)
+  monitorAllPosts Boolean        @default(false) // Auto-discover & monitor all user's posts
+  autoConnect     Boolean        @default(false) // Connect with ALL commenters (no keyword needed)
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 
