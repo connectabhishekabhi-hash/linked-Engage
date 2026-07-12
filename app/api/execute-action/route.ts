@@ -63,7 +63,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const matchedPost = scrapedPosts.find((post) =>
+    const matchedPost = scrapedPosts.find((post: any) =>
       post?.activityUrn === resolvedUrn ||
       post?.shareUrn === resolvedUrn ||
       post?.url === targetUrl

@@ -50,7 +50,7 @@ export async function POST(req: NextRequest) {
   }
 
   const uniqueProfiles = Array.from(
-    new Map(profiles.map((profile) => [profile.profileUrl, profile])).values()
+    new Map(profiles.map((profile: any) => [profile.profileUrl, profile])).values()
   );
 
   // Upsert leads
@@ -65,12 +65,12 @@ export async function POST(req: NextRequest) {
   );
 
   const vanityByProfileUrl = new Map(
-    uniqueProfiles.map((profile) => [profile.profileUrl, profile.vanityName])
+    uniqueProfiles.map((profile: any) => [profile.profileUrl, profile.vanityName])
   );
 
   // Create an ExtensionJob for each lead — extension picks these up via polling
   await prisma.extensionJob.createMany({
-    data: created.map((lead) => ({
+    data: created.map((lead: any) => ({
       userId:  session.user.id,
       leadId:  lead.id,
       type:    "SCRAPE",
