@@ -38,9 +38,9 @@ export async function GET(req: NextRequest) {
     return `"${str}"`;
   };
 
-  const rows = leads.map((lead) => {
-    const comment = lead.drafts.find((d) => d.type === "COMMENT")?.content ?? "";
-    const connNote = lead.drafts.find((d) => d.type === "CONNECTION_REQUEST")?.content ?? "";
+  const rows = leads.map((lead: any) => {
+    const comment = lead.drafts.find((d: any) => d.type === "COMMENT")?.content ?? "";
+    const connNote = lead.drafts.find((d: any) => d.type === "CONNECTION_REQUEST")?.content ?? "";
 
     return [
       escape(lead.fullName),
