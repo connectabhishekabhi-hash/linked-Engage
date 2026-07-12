@@ -88,7 +88,7 @@ export async function POST(req: NextRequest) {
   });
 }
 
-export async function GET(req: NextRequest) {
+export async function GET(_req: NextRequest) {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
@@ -104,7 +104,7 @@ export async function GET(req: NextRequest) {
 }
 
 // DELETE /api/leads — flush all leads for the current user
-export async function DELETE(req: NextRequest) {
+export async function DELETE(_req: NextRequest) {
   const session = await getServerSession(authOptions);
   if (!session?.user?.id) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });

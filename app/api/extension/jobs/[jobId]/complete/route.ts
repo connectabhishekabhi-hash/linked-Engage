@@ -139,7 +139,7 @@ export async function POST(
         if (draftErr?.message?.includes("postUrn") || draftErr?.code === "P2009") {
           console.warn("[complete] postUrn column missing, saving drafts without it");
           const fallbackData = [
-            ...commentDrafts.map(({ postUrn: _pu, ...rest }: any) => rest),
+            ...commentDrafts.map(({ postUrn: _postUrn, ...rest }: any) => rest),
             connDraft,
           ];
           await (prisma.draft.createMany as any)({ data: fallbackData });

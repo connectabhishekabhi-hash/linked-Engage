@@ -136,7 +136,7 @@ export default function SearchPage() {
   const [statusMsg,  setStatusMsg]  = useState("");
   const [error,      setError]      = useState<string | null>(null);
   const [added,      setAdded]      = useState<Set<string>>(new Set());
-  const [totalFound, setTotalFound] = useState(0);
+  const [, setTotalFound] = useState(0);
 
   const pollRef    = useRef<NodeJS.Timeout | null>(null);
   // Active filter criteria captured at search-start, used to post-filter results
@@ -160,26 +160,6 @@ export default function SearchPage() {
   const searchUrl = buildSearchUrl(activeFilters);
 
   const hasQuery = !!(title.trim() || keywords.trim() || company.trim());
-
-  // ── Client-side filter — LinkedIn's keyword search ignores boolean operators,
-  //    so we enforce title / exclude terms ourselves after results arrive.
-  const applyFilters = useCallback((results: SearchProfile[]): SearchProfile[] => {
-    const { title, excludeTerms, degrees } = filterRef.current;
-    return results.filter(p => {
-      const haystack = `${p.fullName} ${p.headline}`.toLowerCase();
-      // Title filter: only enforce when headline is non-empty (extraction can fail).
-      // If headline is blank we can't verify — pass the profile through.
-      if (title && p.headline.trim() && !p.headline.toLowerCase().includes(title.toLowerCase())) return false;
-      // Connection degree filter: if specific degrees are selected, drop others.
-      // Profiles with unknown degree ("") are passed through as we can't verify.
-      if (degrees.length > 0 && p.connectionDegree && !degrees.includes(p.connectionDegree)) return false;
-      // Exclude: drop profiles whose headline or name contains any excluded term
-      for (const term of excludeTerms) {
-        if (haystack.includes(term.toLowerCase())) return false;
-      }
-      return true;
-    });
-  }, []);
 
   // ── Polling ───────────────────────────────────────────────────────────────
   const poll = useCallback(async (id: string) => {
@@ -205,7 +185,7 @@ export default function SearchPage() {
         if (pollRef.current) clearInterval(pollRef.current);
       }
     } catch { /* network blip — keep polling */ }
-  }, [applyFilters]);
+  }, []);
 
   useEffect(() => {
     if (!searchId) return;
