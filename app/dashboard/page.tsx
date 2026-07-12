@@ -1,12 +1,9 @@
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import type { Lead, Draft } from "@prisma/client";
 import { redirect } from "next/navigation";
 import Link from "next/link";
 import ApprovalInbox from "@/components/ApprovalInbox";
-
-type LeadWithDrafts = Lead & { drafts: Draft[] };
 
 async function getDashboardData(userId: string) {
   const [leads, account] = await Promise.all([
@@ -32,7 +29,7 @@ export default async function DashboardPage() {
   if (!session?.user?.id) redirect("/login");
 
   const { leads, isConnected } = await getDashboardData(session.user.id);
-  const typedLeads = leads as LeadWithDrafts[];
+  const typedLeads = leads as any[];
 
   const stats = {
     scraping: typedLeads.filter((l) => l.status === "SCRAPING").length,
