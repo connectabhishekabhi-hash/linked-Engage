@@ -3,6 +3,7 @@ export const runtime = "nodejs";
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
 import bcrypt from "bcryptjs";
+import { randomUUID } from "crypto";
 import { z } from "zod";
 
 const schema = z.object({
@@ -36,7 +37,7 @@ export async function POST(req: NextRequest) {
     const passwordHash = await bcrypt.hash(password, 12);
 
     await prisma.user.create({
-      data: { name, email: email.toLowerCase(), passwordHash },
+      data: { name, email: email.toLowerCase(), passwordHash, apiToken: randomUUID() },
     });
 
     return NextResponse.json({ success: true }, { status: 201 });

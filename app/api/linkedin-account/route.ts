@@ -55,10 +55,20 @@ export async function GET(_req: NextRequest) {
     }),
   ]);
 
+  let apiToken = user?.apiToken ?? null;
+  if (!apiToken) {
+    const { randomUUID } = await import("crypto");
+    apiToken = randomUUID();
+    await prisma.user.update({
+      where: { id: session.user.id },
+      data: { apiToken },
+    });
+  }
+
   return NextResponse.json({
     connected: !!account?.isActive,
     account,
-    apiToken: user?.apiToken ?? null,
+    apiToken,
   });
 }
 
