@@ -23,6 +23,7 @@ model User {
   postAnalytics    PostAnalytics[]
   aiProfile        UserAIProfile?
   leadSearches     LeadSearch[]
+  researchCampaigns ResearchCampaign[]
 
   @@map("app_users")
 }
@@ -144,6 +145,178 @@ model LinkedInAccount {
   updatedAt           DateTime  @updatedAt
 }
 
+// ─── Research Campaign (ICP-based company discovery) ─────────────────────────
+model ResearchCampaign {
+  id                  String                 @id @default(cuid())
+  userId              String
+  user                User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name                String
+  industry            String
+  location            String
+  companySize         String?
+  services            String[]               // keywords / service types
+  exclusions          String[]               // things to exclude
+  targetCount         Int                    @default(30)
+  additionalInstructions String?             @db.Text
+  status              ResearchCampaignStatus @default(DRAFT)
+  // Progress counters (denormalized for fast reads)
+  companiesFound      Int                    @default(0)
+  companiesQualified  Int                    @default(0)
+  contactsFound       Int                    @default(0)
+  createdAt           DateTime               @default(now())
+  updatedAt           DateTime               @updatedAt
+  companies           ResearchCompany[]
+  researchJobs        ResearchJob[]
+
+  @@index([userId, status])
+}
+
+enum ResearchCampaignStatus {
+  DRAFT
+  DISCOVERING
+  RESEARCHING
+  QUALIFYING
+  FINDING_CONTACTS
+  ANALYZING
+  COMPLETED
+  PAUSED
+  FAILED
+}
+
+// ─── Research Company (company-first entity) ─────────────────────────────────
+model ResearchCompany {
+  id                  String              @id @default(cuid())
+  campaignId          String
+  campaign            ResearchCampaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  name                String
+  domain              String?
+  website             String?
+  location            String?
+  estimatedSize       String?
+  servicesOffered     String[]
+  description         String?             @db.Text
+  sourceUrl           String?
+  sourceSnippet       String?             @db.Text
+  // Qualification
+  qualificationStatus String?             // QUALIFIED, MAYBE, DISQUALIFIED
+  qualificationScore  Int?                // 0-100
+  qualificationReason String?             @db.Text
+  // Advertising signals
+  googleAdsStatus     String?             // OBSERVED, LIKELY, NO_EVIDENCE, UNKNOWN
+  googleAdsEvidence   String?             @db.Text
+  metaAdsStatus       String?             // OBSERVED, LIKELY, NO_EVIDENCE, UNKNOWN
+  metaAdsEvidence     String?             @db.Text
+  adsCheckedAt        DateTime?
+  // Website analysis
+  websiteStrengths    String[]
+  websiteWeaknesses   String[]
+  conversionIssues    String[]
+  websiteAnalyzedAt   DateTime?
+  // Marketing opportunity
+  opportunity         String?             @db.Text
+  opportunityEvidence String?             @db.Text
+  // Page content captured during research
+  extractedContent    Json?               // { homepage, about, services, contact }
+  // Status
+  researchStatus      ResearchCompanyStatus @default(DISCOVERED)
+  errorMessage        String?
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+  contacts            CompanyContact[]
+  evidence            CompanyEvidence[]
+
+  @@unique([campaignId, domain])
+  @@index([campaignId, researchStatus])
+  @@index([campaignId, qualificationStatus])
+}
+
+enum ResearchCompanyStatus {
+  DISCOVERED
+  EXTRACTING
+  EXTRACTED
+  QUALIFYING
+  QUALIFIED
+  DISQUALIFIED
+  RESEARCHING_CONTACTS
+  CHECKING_ADS
+  ANALYZING
+  COMPLETED
+  FAILED
+}
+
+// ─── Company Contact (decision-makers) ───────────────────────────────────────
+model CompanyContact {
+  id              String          @id @default(cuid())
+  companyId       String
+  company         ResearchCompany @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  fullName        String
+  title           String?
+  linkedinUrl     String?
+  source          String?         // where we found this person
+  confidence      String?         // HIGH, MEDIUM, LOW
+  isPrimary       Boolean         @default(false)
+  leadId          String?         // FK to Lead if added to outreach
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  @@index([companyId])
+}
+
+// ─── Company Evidence (traceable research data) ──────────────────────────────
+model CompanyEvidence {
+  id          String          @id @default(cuid())
+  companyId   String
+  company     ResearchCompany @relation(fields: [companyId], references: [id], onDelete: Cascade)
+  field       String          // which data field this evidences (e.g. "location", "services")
+  value       String          @db.Text
+  sourceUrl   String?
+  confidence  String?         // VERIFIED, INFERRED, LOW
+  checkedAt   DateTime        @default(now())
+
+  @@index([companyId])
+}
+
+// ─── Research Job (granular browser tasks for extension) ─────────────────────
+model ResearchJob {
+  id          String            @id @default(cuid())
+  campaignId  String
+  campaign    ResearchCampaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  companyId   String?           // null for DISCOVER_COMPANIES jobs
+  type        ResearchJobType
+  status      ResearchJobStatus @default(PENDING)
+  payload     Json              // job-specific input
+  result      Json?             // job-specific output
+  error       String?
+  retryCount  Int               @default(0)
+  maxRetries  Int               @default(2)
+  claimedAt   DateTime?
+  completedAt DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@index([campaignId, status])
+  @@index([status, createdAt])
+}
+
+enum ResearchJobType {
+  DISCOVER_COMPANIES
+  EXTRACT_WEBSITE
+  QUALIFY_COMPANY
+  FIND_DECISION_MAKER
+  CHECK_ADS
+  ANALYZE_WEBSITE
+  GENERATE_OPPORTUNITY
+}
+
+enum ResearchJobStatus {
+  PENDING
+  CLAIMED
+  RUNNING
+  COMPLETED
+  FAILED
+  RETRY
+}
+
 model Lead {
   id              String         @id @default(cuid())
   userId          String
@@ -159,6 +332,7 @@ model Lead {
   scrapedPostUrl  String?                   // first post URL
   activityUrn     String?                   // first post activity URN
   scrapedPosts    Json?                     // [{text, url, activityUrn}] — up to 3 posts
+  researchCompanyId String?                 // FK to ResearchCompany if sourced from research
   status          LeadStatus     @default(PENDING)
   drafts          Draft[]
   extensionJobs   ExtensionJob[]

@@ -50,6 +50,21 @@ const NAV = [
     ),
   },
   {
+    label: "Research",
+    href: "/dashboard/research",
+    exact: false,
+    icon: (active: boolean) => (
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none"
+        stroke="currentColor" strokeWidth={active ? 2.2 : 1.8}
+        strokeLinecap="round" strokeLinejoin="round">
+        <path d="M9 2L9 6M15 2L15 6M9 6C6.24 6 4 8.24 4 11L4 13C4 15.76 6.24 18 9 18L15 18C17.76 18 20 15.76 20 13L20 11C20 8.24 17.76 6 15 6L9 6Z"/>
+        <path d="M12 18L12 22M8 22L16 22"/>
+        <circle cx="9" cy="12" r="1.5" fill="currentColor" stroke="none"/>
+        <circle cx="15" cy="12" r="1.5" fill="currentColor" stroke="none"/>
+      </svg>
+    ),
+  },
+  {
     label: "Campaigns",
     href: "/dashboard/campaigns",
     exact: false,

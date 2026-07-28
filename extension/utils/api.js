@@ -99,3 +99,47 @@ export async function failJob(jobId, error) {
     body: JSON.stringify({ error }),
   });
 }
+
+// ─── Research Job API ────────────────────────────────────────────────────────
+
+export async function fetchNextResearchJob() {
+  const token = await getStoredToken();
+  if (!token) return null;
+
+  const res = await fetch(`${BACKEND_URL}/api/extension/research-jobs`, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (res.status === 204) return null;
+  if (!res.ok) {
+    console.error("[api] fetchNextResearchJob failed:", res.status);
+    return null;
+  }
+  return res.json();
+}
+
+export async function completeResearchJob(jobId, result) {
+  const token = await getStoredToken();
+  const res = await fetch(`${BACKEND_URL}/api/extension/research-jobs/${jobId}/complete`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ result }),
+  });
+  if (!res.ok) throw new Error(`completeResearchJob failed: ${res.status}`);
+  return res.json();
+}
+
+export async function failResearchJob(jobId, error) {
+  const token = await getStoredToken();
+  await fetch(`${BACKEND_URL}/api/extension/research-jobs/${jobId}/fail`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify({ error }),
+  });
+}

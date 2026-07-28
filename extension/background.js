@@ -7,16 +7,18 @@
  */
 
 import { getLinkedInAuth }              from "./utils/auth.js";
-import { fetchNextJob, completeJob, failJob, getStoredToken } from "./utils/api.js";
+import { fetchNextJob, completeJob, failJob, getStoredToken, fetchNextResearchJob, completeResearchJob, failResearchJob } from "./utils/api.js";
 
 // ── Module-load proof: if you see this in the service worker console the
 //    script parsed and loaded correctly.
-console.log("[bg] background.js module loaded ✓ v16 (campaign monitoring system)");
+console.log("[bg] background.js module loaded ✓ v17 (research engine + campaign monitoring)");
 
 const ALARM_NAME = "linkedengage-poll";
 const CAMPAIGN_ALARM_NAME = "linkedengage-campaign-monitor";
+const RESEARCH_ALARM_NAME = "linkedengage-research";
 const POLL_INTERVAL_MINUTES = 0.5; // every 30 seconds
 const CAMPAIGN_POLL_MINUTES = 2;   // check campaigns every 2 minutes
+const RESEARCH_POLL_MINUTES = 1;   // check research jobs every 60 seconds
 
 // ─── Install / startup ────────────────────────────────────────────────────────
 
@@ -46,6 +48,12 @@ function setupAlarm() {
       console.log("[bg] Campaign monitor alarm created");
     }
   });
+  chrome.alarms.get(RESEARCH_ALARM_NAME, (existing) => {
+    if (!existing) {
+      chrome.alarms.create(RESEARCH_ALARM_NAME, { periodInMinutes: RESEARCH_POLL_MINUTES });
+      console.log("[bg] Research alarm created");
+    }
+  });
 }
 
 // ─── Alarm + message handlers ─────────────────────────────────────────────────
@@ -53,6 +61,7 @@ function setupAlarm() {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === ALARM_NAME) await pollAndProcess();
   if (alarm.name === CAMPAIGN_ALARM_NAME) await monitorCampaigns();
+  if (alarm.name === RESEARCH_ALARM_NAME) await pollAndProcessResearch();
 });
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -2679,4 +2688,448 @@ function extractCommentsFromPost(csrfToken) {
 
   debug.push(`FINAL: ${comments.length} comments`);
   return { comments, debug };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// RESEARCH ENGINE — Browser-based company discovery and analysis
+// ═══════════════════════════════════════════════════════════════════════════════
+
+let researchBusy = false;
+
+async function pollAndProcessResearch() {
+  if (researchBusy) {
+    console.log("[research] Busy — skipping poll");
+    return;
+  }
+
+  const token = await getStoredToken();
+  if (!token) return;
+
+  researchBusy = true;
+  try {
+    const job = await fetchNextResearchJob();
+    if (!job) return;
+
+    console.log(`[research] Processing ${job.type} job ${job.id}`);
+
+    switch (job.type) {
+      case "DISCOVER_COMPANIES":
+        await handleDiscoverCompanies(job);
+        break;
+      case "EXTRACT_WEBSITE":
+        await handleExtractWebsite(job);
+        break;
+      case "FIND_DECISION_MAKER":
+        await handleFindDecisionMaker(job);
+        break;
+      case "CHECK_ADS":
+        await handleCheckAds(job);
+        break;
+      default:
+        console.warn(`[research] Unknown job type: ${job.type}`);
+        await failResearchJob(job.id, `Unknown job type: ${job.type}`);
+    }
+  } catch (err) {
+    console.error("[research] Poll error:", err);
+  } finally {
+    researchBusy = false;
+  }
+}
+
+// ── Helper: random delay for human-like behavior ────────────────────────────
+
+function randomDelay(minMs, maxMs) {
+  return new Promise(resolve => setTimeout(resolve, minMs + Math.random() * (maxMs - minMs)));
+}
+
+// ── Helper: open tab, wait for load, extract content, close tab ─────────────
+
+async function openAndExtract(url, extractFn, timeoutMs = 30000) {
+  let tab;
+  try {
+    tab = await chrome.tabs.create({ url, active: false });
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Page load timeout")), timeoutMs);
+      const listener = (tabId, info) => {
+        if (tabId === tab.id && info.status === "complete") {
+          chrome.tabs.onUpdated.removeListener(listener);
+          clearTimeout(timeout);
+          resolve();
+        }
+      };
+      chrome.tabs.onUpdated.addListener(listener);
+    });
+
+    await randomDelay(2000, 4000);
+
+    const results = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: extractFn,
+    });
+
+    return results[0]?.result ?? null;
+  } finally {
+    if (tab?.id) {
+      try { await chrome.tabs.remove(tab.id); } catch {}
+    }
+  }
+}
+
+// ═══ DISCOVER_COMPANIES ═════════════════════════════════════════════════════
+
+async function handleDiscoverCompanies(job) {
+  const { query, maxResults = 15 } = job.payload;
+  console.log(`[research] Discovering companies: "${query}"`);
+
+  try {
+    const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=${maxResults}`;
+    const results = await openAndExtract(searchUrl, extractGoogleResults);
+
+    if (!results || !results.length) {
+      await completeResearchJob(job.id, { companies: [] });
+      return;
+    }
+
+    console.log(`[research] Found ${results.length} search results for "${query}"`);
+    await completeResearchJob(job.id, { companies: results });
+  } catch (err) {
+    console.error(`[research] DISCOVER error:`, err);
+    await failResearchJob(job.id, err.message);
+  }
+}
+
+function extractGoogleResults() {
+  const results = [];
+  const items = document.querySelectorAll("div.g, div[data-hveid]");
+
+  for (const item of items) {
+    const linkEl = item.querySelector("a[href^='http']");
+    const titleEl = item.querySelector("h3");
+    const snippetEl = item.querySelector("[data-sncf], .VwiC3b, [style*='-webkit-line-clamp']");
+
+    if (!linkEl || !titleEl) continue;
+
+    const url = linkEl.href;
+    if (!url || url.includes("google.com") || url.includes("youtube.com") || url.includes("wikipedia.org")) continue;
+
+    let domain;
+    try { domain = new URL(url).hostname.replace(/^www\./, ""); } catch { continue; }
+
+    results.push({
+      name: titleEl.textContent.trim(),
+      url: url,
+      website: `https://${domain}`,
+      snippet: snippetEl?.textContent?.trim() || "",
+      sourceUrl: window.location.href,
+    });
+  }
+
+  // Deduplicate by domain
+  const seen = new Set();
+  return results.filter(r => {
+    try {
+      const d = new URL(r.url).hostname.replace(/^www\./, "");
+      if (seen.has(d)) return false;
+      seen.add(d);
+      return true;
+    } catch { return false; }
+  });
+}
+
+// ═══ EXTRACT_WEBSITE ════════════════════════════════════════════════════════
+
+async function handleExtractWebsite(job) {
+  const { website } = job.payload;
+  if (!website) {
+    await failResearchJob(job.id, "No website URL provided");
+    return;
+  }
+
+  console.log(`[research] Extracting website: ${website}`);
+
+  try {
+    // Visit homepage
+    const homepage = await openAndExtract(website, extractPageContent);
+    await randomDelay(1500, 3000);
+
+    // Try to find and visit About page
+    let aboutContent = null;
+    if (homepage?.internalLinks) {
+      const aboutLink = homepage.internalLinks.find(l =>
+        /about|who-we-are|our-story|company/i.test(l)
+      );
+      if (aboutLink) {
+        aboutContent = await openAndExtract(aboutLink, extractPageContent);
+        await randomDelay(1500, 3000);
+      }
+    }
+
+    // Try to find and visit Services page
+    let servicesContent = null;
+    if (homepage?.internalLinks) {
+      const servicesLink = homepage.internalLinks.find(l =>
+        /services|solutions|what-we-do|offerings/i.test(l)
+      );
+      if (servicesLink) {
+        servicesContent = await openAndExtract(servicesLink, extractPageContent);
+        await randomDelay(1500, 3000);
+      }
+    }
+
+    // Try Contact page for location
+    let contactContent = null;
+    if (homepage?.internalLinks) {
+      const contactLink = homepage.internalLinks.find(l =>
+        /contact|location|find-us/i.test(l)
+      );
+      if (contactLink) {
+        contactContent = await openAndExtract(contactLink, extractPageContent);
+      }
+    }
+
+    // Build structured result
+    const content = {
+      homepage: homepage?.text?.slice(0, 3000) || "",
+      about: aboutContent?.text?.slice(0, 2000) || "",
+      services: servicesContent?.text?.slice(0, 2000) || "",
+      contact: contactContent?.text?.slice(0, 1000) || "",
+    };
+
+    // Extract structured data from homepage
+    const services = extractServicesFromContent(content);
+    const location = extractLocationFromContent(content);
+
+    const evidence = [];
+    if (location) {
+      evidence.push({ field: "location", value: location, sourceUrl: website, confidence: "INFERRED" });
+    }
+    for (const svc of services.slice(0, 5)) {
+      evidence.push({ field: "service", value: svc, sourceUrl: website, confidence: "VERIFIED" });
+    }
+
+    await completeResearchJob(job.id, {
+      content,
+      services,
+      location,
+      estimatedSize: null,
+      evidence,
+    });
+
+    console.log(`[research] Extracted website: ${website} (${services.length} services found)`);
+  } catch (err) {
+    console.error(`[research] EXTRACT error:`, err);
+    await failResearchJob(job.id, err.message);
+  }
+}
+
+function extractPageContent() {
+  const text = document.body?.innerText?.slice(0, 5000) || "";
+  const title = document.title || "";
+  const metaDesc = document.querySelector('meta[name="description"]')?.content || "";
+
+  // Collect internal links
+  const origin = window.location.origin;
+  const links = [...document.querySelectorAll("a[href]")]
+    .map(a => a.href)
+    .filter(h => h.startsWith(origin) || h.startsWith("/"))
+    .map(h => h.startsWith("/") ? origin + h : h)
+    .filter((v, i, a) => a.indexOf(v) === i)
+    .slice(0, 30);
+
+  // Check for conversion elements
+  const hasForms = document.querySelectorAll("form").length;
+  const hasPhoneCta = !!document.body?.innerHTML?.match(/tel:/i);
+  const hasQuoteForm = !!text.match(/free quote|get a quote|request.*quote|free estimate/i);
+
+  return {
+    text,
+    title,
+    metaDesc,
+    internalLinks: links,
+    forms: hasForms,
+    hasPhoneCta,
+    hasQuoteForm,
+  };
+}
+
+function extractServicesFromContent(content) {
+  const allText = `${content.homepage} ${content.services} ${content.about}`.toLowerCase();
+  const servicePatterns = [
+    /(?:we (?:offer|provide|specialize|do)|our services|services include)[:\s]*([\s\S]{10,200}?)(?:\.|$)/gi,
+  ];
+  const found = new Set();
+  for (const pattern of servicePatterns) {
+    const match = allText.match(pattern);
+    if (match) {
+      match[0].split(/[,\n•·]/).forEach(s => {
+        const trimmed = s.replace(/we offer|we provide|our services|services include/gi, "").trim();
+        if (trimmed.length > 3 && trimmed.length < 60) found.add(trimmed);
+      });
+    }
+  }
+  return [...found].slice(0, 10);
+}
+
+function extractLocationFromContent(content) {
+  const allText = `${content.contact} ${content.homepage} ${content.about}`;
+  // Look for US state + city patterns
+  const stateMatch = allText.match(/(?:located|serving|based)\s+in\s+([^.]{3,50})/i);
+  if (stateMatch) return stateMatch[1].trim();
+  // Look for address patterns
+  const addressMatch = allText.match(/(\d+[^,]+,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?,\s*[A-Z]{2}\s*\d{5})/);
+  if (addressMatch) return addressMatch[1].trim();
+  return null;
+}
+
+// ═══ FIND_DECISION_MAKER ════════════════════════════════════════════════════
+
+async function handleFindDecisionMaker(job) {
+  const { companyName, domain } = job.payload;
+  console.log(`[research] Finding decision maker for: ${companyName}`);
+
+  try {
+    const candidates = [];
+
+    // Search 1: Company + Founder/CEO
+    const q1 = `"${companyName}" founder OR CEO OR owner site:linkedin.com/in`;
+    const results1 = await openAndExtract(
+      `https://www.google.com/search?q=${encodeURIComponent(q1)}&num=5`,
+      extractPeopleFromGoogle
+    );
+    if (results1) candidates.push(...results1.map(r => ({ ...r, source: "google_ceo_search" })));
+
+    await randomDelay(2000, 4000);
+
+    // Search 2: Company + Marketing Director
+    const q2 = `"${companyName}" "marketing director" OR "head of marketing" OR CMO site:linkedin.com/in`;
+    const results2 = await openAndExtract(
+      `https://www.google.com/search?q=${encodeURIComponent(q2)}&num=5`,
+      extractPeopleFromGoogle
+    );
+    if (results2) candidates.push(...results2.map(r => ({ ...r, source: "google_marketing_search" })));
+
+    await randomDelay(1500, 3000);
+
+    // Search 3: Company name + LinkedIn (broader)
+    if (candidates.length === 0) {
+      const q3 = `"${companyName}" ${domain || ""} site:linkedin.com/in`;
+      const results3 = await openAndExtract(
+        `https://www.google.com/search?q=${encodeURIComponent(q3)}&num=5`,
+        extractPeopleFromGoogle
+      );
+      if (results3) candidates.push(...results3.map(r => ({ ...r, source: "google_broad_search" })));
+    }
+
+    console.log(`[research] Found ${candidates.length} candidate contacts for ${companyName}`);
+    await completeResearchJob(job.id, { candidates });
+  } catch (err) {
+    console.error(`[research] FIND_DM error:`, err);
+    await failResearchJob(job.id, err.message);
+  }
+}
+
+function extractPeopleFromGoogle() {
+  const results = [];
+  const items = document.querySelectorAll("div.g, div[data-hveid]");
+
+  for (const item of items) {
+    const linkEl = item.querySelector("a[href*='linkedin.com/in/']");
+    const titleEl = item.querySelector("h3");
+    const snippetEl = item.querySelector("[data-sncf], .VwiC3b, [style*='-webkit-line-clamp']");
+
+    if (!linkEl || !titleEl) continue;
+
+    const url = linkEl.href;
+    const titleText = titleEl.textContent.trim();
+    const snippet = snippetEl?.textContent?.trim() || "";
+
+    // Parse LinkedIn title format: "Name - Title - Company | LinkedIn"
+    const parts = titleText.split(/\s*[-–|]\s*/);
+    const name = parts[0] || "";
+    const title = parts[1] || "";
+
+    if (!name || name.length < 2) continue;
+
+    results.push({
+      name: name.trim(),
+      title: title.trim(),
+      linkedinUrl: url.split("?")[0],
+    });
+  }
+
+  return results;
+}
+
+// ═══ CHECK_ADS ══════════════════════════════════════════════════════════════
+
+async function handleCheckAds(job) {
+  const { companyName, domain } = job.payload;
+  console.log(`[research] Checking ads for: ${companyName} (${domain})`);
+
+  try {
+    // Check Meta Ad Library
+    let metaResult = { status: "UNKNOWN", evidence: null };
+    try {
+      const metaUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=US&q=${encodeURIComponent(companyName)}`;
+      const metaData = await openAndExtract(metaUrl, extractMetaAdResults);
+      await randomDelay(2000, 3000);
+
+      if (metaData && metaData.adsFound > 0) {
+        metaResult = { status: "OBSERVED", evidence: `${metaData.adsFound} active ads found in Meta Ad Library` };
+      } else if (metaData && metaData.adsFound === 0) {
+        metaResult = { status: "NO_EVIDENCE", evidence: "No active ads found in Meta Ad Library" };
+      }
+    } catch {
+      metaResult = { status: "UNKNOWN", evidence: "Could not check Meta Ad Library" };
+    }
+
+    // Check for Google Ads signals on the company website
+    let googleResult = { status: "UNKNOWN", evidence: null };
+    if (domain) {
+      try {
+        const siteData = await openAndExtract(`https://${domain}`, extractAdSignals);
+        await randomDelay(1500, 2500);
+
+        if (siteData?.hasGoogleAdsTag) {
+          googleResult = { status: "LIKELY", evidence: "Google Ads conversion tag or gtag found on website" };
+        } else if (siteData?.hasGTM) {
+          googleResult = { status: "LIKELY", evidence: "Google Tag Manager found (may be used for ads tracking)" };
+        } else {
+          googleResult = { status: "NO_EVIDENCE", evidence: "No Google Ads tags detected on website" };
+        }
+      } catch {
+        googleResult = { status: "UNKNOWN", evidence: "Could not check website for ad signals" };
+      }
+    }
+
+    await completeResearchJob(job.id, {
+      googleAds: googleResult,
+      metaAds: metaResult,
+    });
+
+    console.log(`[research] Ads check done for ${companyName}: Google=${googleResult.status}, Meta=${metaResult.status}`);
+  } catch (err) {
+    console.error(`[research] CHECK_ADS error:`, err);
+    await failResearchJob(job.id, err.message);
+  }
+}
+
+function extractMetaAdResults() {
+  const text = document.body?.innerText || "";
+  // Check for "No ads match" or similar
+  if (/no ads match|no results/i.test(text)) return { adsFound: 0 };
+  // Count ad cards
+  const adCards = document.querySelectorAll("[class*='_7jvw'], [class*='ad-card'], [data-testid*='ad']");
+  if (adCards.length > 0) return { adsFound: adCards.length };
+  // Fallback: look for ad preview elements
+  const previews = document.querySelectorAll("div[class*='x1lliihq']");
+  return { adsFound: previews.length > 2 ? previews.length : 0 };
+}
+
+function extractAdSignals() {
+  const html = document.documentElement?.innerHTML || "";
+  const hasGoogleAdsTag = /googleads|google_conversion|AW-\d+|gtag.*conversion/i.test(html);
+  const hasGTM = /googletagmanager|GTM-[A-Z0-9]+/i.test(html);
+  const hasMetaPixel = /fbq\(|facebook\.com\/tr|Meta Pixel/i.test(html);
+  return { hasGoogleAdsTag, hasGTM, hasMetaPixel };
 }
