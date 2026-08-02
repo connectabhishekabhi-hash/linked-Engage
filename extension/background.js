@@ -2696,21 +2696,32 @@ function extractCommentsFromPost(csrfToken) {
 //       Check ads → Find founder LinkedIn
 // ═══════════════════════════════════════════════════════════════════════════════
 
-let researchBusy = false;
+const MAX_CONCURRENT_RESEARCH = 3;
+let activeResearchJobs = 0;
 
 async function pollAndProcessResearch() {
-  if (researchBusy) return;
-
   const token = await getStoredToken();
   if (!token) return;
 
-  researchBusy = true;
-  try {
+  // Fill up to MAX_CONCURRENT_RESEARCH slots
+  while (activeResearchJobs < MAX_CONCURRENT_RESEARCH) {
     const job = await fetchNextResearchJob();
-    if (!job) return;
+    if (!job) break;
 
-    console.log(`[research] Processing ${job.type} job ${job.id}`);
+    activeResearchJobs++;
+    console.log(`[research] Starting ${job.type} (${activeResearchJobs}/${MAX_CONCURRENT_RESEARCH} active)`);
 
+    processResearchJob(job).finally(() => {
+      activeResearchJobs--;
+    });
+
+    // Small delay between claims to avoid race conditions
+    await new Promise(r => setTimeout(r, 300));
+  }
+}
+
+async function processResearchJob(job) {
+  try {
     switch (job.type) {
       case "DISCOVER_COMPANIES":
         await handleDiscoverCompanies(job);
@@ -2728,9 +2739,8 @@ async function pollAndProcessResearch() {
         await failResearchJob(job.id, `Unknown job type: ${job.type}`);
     }
   } catch (err) {
-    console.error("[research] Poll error:", err);
-  } finally {
-    researchBusy = false;
+    console.error(`[research] Job ${job.id} error:`, err);
+    try { await failResearchJob(job.id, err.message); } catch {}
   }
 }
 
@@ -2797,7 +2807,9 @@ function extractGoogleResults() {
   const blocked = ["google.com","youtube.com","wikipedia.org","facebook.com",
     "linkedin.com","twitter.com","instagram.com","tiktok.com","reddit.com",
     "pinterest.com","amazon.com","yelp.com","bbb.org","glassdoor.com",
-    "indeed.com","crunchbase.com"];
+    "indeed.com","crunchbase.com","tripadvisor.com","tripadvisor.in",
+    "lusha.com","canstar.co.nz","yellowpages.com","trustpilot.com",
+    "bloomberg.com","zoominfo.com","apollo.io","bing.com"];
 
   // Strategy 1: standard organic results
   document.querySelectorAll("div.g").forEach(item => {

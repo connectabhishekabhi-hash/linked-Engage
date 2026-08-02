@@ -48,20 +48,19 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ job
 }
 
 // ── DISCOVER_COMPANIES ──────────────────────────────────────────────────────
+// PARALLEL: immediately create EXTRACT jobs for newly discovered companies
+// Don't wait for all discovery jobs to finish
 
 async function handleDiscoveryResults(job: any, result: any) {
   const companies = result?.companies ?? [];
-  if (!companies.length) {
-    await checkStageComplete(job.campaignId, "DISCOVER_COMPANIES", "RESEARCHING", createExtractJobs);
-    return;
-  }
+  const newCompanyIds: string[] = [];
 
   for (const c of companies) {
     const domain = extractDomain(c.website || c.url || "");
     if (!domain) continue;
 
     try {
-      await (prisma as any).researchCompany.upsert({
+      const company = await (prisma as any).researchCompany.upsert({
         where: { campaignId_domain: { campaignId: job.campaignId, domain } },
         create: {
           campaignId: job.campaignId,
@@ -74,50 +73,55 @@ async function handleDiscoveryResults(job: any, result: any) {
         },
         update: {},
       });
+      // Only create extract job for truly new companies (not duplicates)
+      if (company.researchStatus === "DISCOVERED") {
+        newCompanyIds.push(company.id);
+      }
     } catch {
       // duplicate — skip
     }
   }
 
+  // Update campaign counter
   const totalFound = await (prisma as any).researchCompany.count({
     where: { campaignId: job.campaignId },
   });
   await (prisma as any).researchCampaign.update({
     where: { id: job.campaignId },
-    data: { companiesFound: totalFound },
+    data: { companiesFound: totalFound, status: "RESEARCHING" },
   });
 
-  await checkStageComplete(job.campaignId, "DISCOVER_COMPANIES", "RESEARCHING", createExtractJobs);
-}
-
-async function createExtractJobs(campaignId: string) {
-  const discovered = await (prisma as any).researchCompany.findMany({
-    where: { campaignId, researchStatus: "DISCOVERED" },
-    select: { id: true, website: true, domain: true },
-  });
-
-  if (discovered.length === 0) {
-    await (prisma as any).researchCampaign.update({
-      where: { id: campaignId },
-      data: { status: "COMPLETED" },
+  // IMMEDIATELY create EXTRACT_WEBSITE jobs for new companies (don't wait for all discovery)
+  if (newCompanyIds.length > 0) {
+    const newCompanies = await (prisma as any).researchCompany.findMany({
+      where: { id: { in: newCompanyIds } },
+      select: { id: true, website: true, domain: true },
     });
-    return;
-  }
 
-  const jobs = discovered.map((c: any) => ({
-    campaignId,
-    companyId: c.id,
-    type: "EXTRACT_WEBSITE",
-    status: "PENDING",
-    payload: { website: c.website, domain: c.domain },
-  }));
-  await (prisma as any).researchJob.createMany({ data: jobs });
+    const extractJobs = newCompanies.map((c: any) => ({
+      campaignId: job.campaignId,
+      companyId: c.id,
+      type: "EXTRACT_WEBSITE",
+      status: "PENDING",
+      payload: { website: c.website, domain: c.domain },
+    }));
+    if (extractJobs.length > 0) {
+      await (prisma as any).researchJob.createMany({ data: extractJobs });
+    }
+  }
 }
 
 // ── EXTRACT_WEBSITE ─────────────────────────────────────────────────────────
+// PARALLEL: immediately create FIND_DM + CHECK_ADS jobs for this company
+// Don't wait for all extractions to finish
 
 async function handleExtractionResults(job: any, result: any) {
   if (!job.companyId) return;
+
+  const company = await (prisma as any).researchCompany.findUnique({
+    where: { id: job.companyId },
+  });
+  if (!company) return;
 
   await (prisma as any).researchCompany.update({
     where: { id: job.companyId },
@@ -126,12 +130,13 @@ async function handleExtractionResults(job: any, result: any) {
       servicesOffered: result?.services ?? [],
       location: result?.location || null,
       estimatedSize: result?.estimatedSize || null,
-      researchStatus: "EXTRACTED",
-      // Store social links and contact info in extractedContent
+      qualificationStatus: "QUALIFIED",
+      qualificationScore: 100,
+      researchStatus: "QUALIFIED",
     },
   });
 
-  // Store social links as evidence
+  // Store social links, emails, phones as evidence
   const evidence: any[] = [];
   if (result?.socials) {
     for (const [platform, url] of Object.entries(result.socials)) {
@@ -148,76 +153,46 @@ async function handleExtractionResults(job: any, result: any) {
   }
   if (result?.emails?.length) {
     for (const email of result.emails) {
-      evidence.push({
-        companyId: job.companyId,
-        field: "email",
-        value: email,
-        sourceUrl: result?.website || job.payload?.website,
-        confidence: "VERIFIED",
-      });
+      evidence.push({ companyId: job.companyId, field: "email", value: email, sourceUrl: job.payload?.website, confidence: "VERIFIED" });
     }
   }
   if (result?.phones?.length) {
     for (const phone of result.phones) {
-      evidence.push({
-        companyId: job.companyId,
-        field: "phone",
-        value: phone,
-        sourceUrl: result?.website || job.payload?.website,
-        confidence: "VERIFIED",
-      });
+      evidence.push({ companyId: job.companyId, field: "phone", value: phone, sourceUrl: job.payload?.website, confidence: "VERIFIED" });
     }
   }
   if (evidence.length > 0) {
     await (prisma as any).companyEvidence.createMany({ data: evidence });
   }
 
-  // When all extractions done → create CHECK_ADS + FIND_DECISION_MAKER jobs
-  await checkStageComplete(job.campaignId, "EXTRACT_WEBSITE", "FINDING_CONTACTS", createRefineJobs);
-}
-
-async function createRefineJobs(campaignId: string) {
-  const companies = await (prisma as any).researchCompany.findMany({
-    where: { campaignId, researchStatus: "EXTRACTED" },
-    select: { id: true, name: true, domain: true },
+  // Update qualified count
+  const qualifiedCount = await (prisma as any).researchCompany.count({
+    where: { campaignId: job.campaignId, qualificationStatus: "QUALIFIED" },
   });
-
-  if (companies.length === 0) {
-    await (prisma as any).researchCampaign.update({
-      where: { id: campaignId },
-      data: { status: "COMPLETED" },
-    });
-    return;
-  }
-
-  // Mark all extracted companies as QUALIFIED (no AI gate — everything goes through)
-  await (prisma as any).researchCompany.updateMany({
-    where: { campaignId, researchStatus: "EXTRACTED" },
-    data: { qualificationStatus: "QUALIFIED", qualificationScore: 100, researchStatus: "QUALIFIED" },
-  });
-
   await (prisma as any).researchCampaign.update({
-    where: { id: campaignId },
-    data: { companiesQualified: companies.length },
+    where: { id: job.campaignId },
+    data: { companiesQualified: qualifiedCount, status: "FINDING_CONTACTS" },
   });
 
-  const dmJobs = companies.map((c: any) => ({
-    campaignId,
-    companyId: c.id,
-    type: "FIND_DECISION_MAKER",
-    status: "PENDING",
-    payload: { companyName: c.name, domain: c.domain },
-  }));
-
-  const adsJobs = companies.map((c: any) => ({
-    campaignId,
-    companyId: c.id,
-    type: "CHECK_ADS",
-    status: "PENDING",
-    payload: { companyName: c.name, domain: c.domain },
-  }));
-
-  await (prisma as any).researchJob.createMany({ data: [...dmJobs, ...adsJobs] });
+  // IMMEDIATELY create FIND_DM + CHECK_ADS for THIS company (parallel, don't wait)
+  await (prisma as any).researchJob.createMany({
+    data: [
+      {
+        campaignId: job.campaignId,
+        companyId: job.companyId,
+        type: "FIND_DECISION_MAKER",
+        status: "PENDING",
+        payload: { companyName: company.name, domain: company.domain },
+      },
+      {
+        campaignId: job.campaignId,
+        companyId: job.companyId,
+        type: "CHECK_ADS",
+        status: "PENDING",
+        payload: { companyName: company.name, domain: company.domain },
+      },
+    ],
+  });
 }
 
 // ── FIND_DECISION_MAKER ─────────────────────────────────────────────────────
@@ -226,8 +201,6 @@ async function handleDecisionMakerResults(job: any, result: any) {
   if (!job.companyId) return;
 
   const candidates = result?.candidates ?? [];
-
-  // Pick the best candidate without AI — prioritize by title
   const selected = pickBestCandidate(candidates);
 
   if (selected) {
@@ -252,7 +225,7 @@ async function handleDecisionMakerResults(job: any, result: any) {
     });
   }
 
-  await checkStageComplete(job.campaignId, "FIND_DECISION_MAKER", null, () => checkAllRefineComplete(job.campaignId));
+  await checkCampaignComplete(job.campaignId);
 }
 
 // ── CHECK_ADS ───────────────────────────────────────────────────────────────
@@ -271,22 +244,24 @@ async function handleAdsResults(job: any, result: any) {
     },
   });
 
-  await checkStageComplete(job.campaignId, "CHECK_ADS", null, () => checkAllRefineComplete(job.campaignId));
+  await checkCampaignComplete(job.campaignId);
 }
 
-async function checkAllRefineComplete(campaignId: string) {
-  const pendingRefine = await (prisma as any).researchJob.count({
+// ── Campaign completion check ───────────────────────────────────────────────
+// Campaign is COMPLETED when zero jobs remain PENDING/CLAIMED across all types
+
+async function checkCampaignComplete(campaignId: string) {
+  const pending = await (prisma as any).researchJob.count({
     where: {
       campaignId,
-      type: { in: ["FIND_DECISION_MAKER", "CHECK_ADS"] },
       status: { in: ["PENDING", "CLAIMED"] },
     },
   });
 
-  if (pendingRefine === 0) {
-    // Mark all qualified companies as COMPLETED
+  if (pending === 0) {
+    // Mark remaining qualified companies as COMPLETED
     await (prisma as any).researchCompany.updateMany({
-      where: { campaignId, qualificationStatus: { in: ["QUALIFIED", "MAYBE"] } },
+      where: { campaignId, qualificationStatus: "QUALIFIED", researchStatus: { not: "COMPLETED" } },
       data: { researchStatus: "COMPLETED" },
     });
 
@@ -298,27 +273,6 @@ async function checkAllRefineComplete(campaignId: string) {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-async function checkStageComplete(
-  campaignId: string,
-  jobType: string,
-  nextStatus: string | null,
-  onComplete: (campaignId: string) => Promise<void>
-) {
-  const pending = await (prisma as any).researchJob.count({
-    where: { campaignId, type: jobType, status: { in: ["PENDING", "CLAIMED"] } },
-  });
-
-  if (pending === 0) {
-    if (nextStatus) {
-      await (prisma as any).researchCampaign.update({
-        where: { id: campaignId },
-        data: { status: nextStatus },
-      });
-    }
-    await onComplete(campaignId);
-  }
-}
 
 function pickBestCandidate(candidates: any[]): any | null {
   if (!candidates.length) return null;
@@ -340,10 +294,11 @@ function extractDomain(url: string): string | null {
   try {
     if (!url.includes("://")) url = "https://" + url;
     const hostname = new URL(url).hostname.replace(/^www\./, "");
-    const blocked = ["google.com", "facebook.com", "linkedin.com", "yelp.com",
-      "youtube.com", "wikipedia.org", "twitter.com", "instagram.com", "tiktok.com",
-      "reddit.com", "pinterest.com", "amazon.com", "bbb.org", "glassdoor.com",
-      "indeed.com", "crunchbase.com", "bloomberg.com"];
+    const blocked = ["google.com","facebook.com","linkedin.com","yelp.com",
+      "youtube.com","wikipedia.org","twitter.com","instagram.com","tiktok.com",
+      "reddit.com","pinterest.com","amazon.com","bbb.org","glassdoor.com",
+      "indeed.com","crunchbase.com","bloomberg.com","tripadvisor.com","tripadvisor.in",
+      "lusha.com","canstar.co.nz","yellowpages.com","yelp.co.nz","trustpilot.com"];
     if (blocked.some(b => hostname.endsWith(b))) return null;
     return hostname || null;
   } catch {
