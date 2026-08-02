@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>LinkedEngage — Research</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f6fa; color: #1a1a2e; }
+
+    .header { background: #4f46e5; color: white; padding: 16px 24px; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 18px; font-weight: 600; }
+    .header .stats { display: flex; gap: 20px; font-size: 13px; }
+    .header .stat-num { font-weight: 700; font-size: 16px; }
+
+    .container { max-width: 1400px; margin: 0 auto; padding: 20px 24px; }
+
+    /* ── Form ── */
+    .form-card { background: white; border-radius: 12px; padding: 20px; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); }
+    .form-row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+    .form-group { display: flex; flex-direction: column; gap: 4px; flex: 1; min-width: 180px; }
+    .form-group label { font-size: 11px; font-weight: 600; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; }
+    .form-group input, .form-group textarea { border: 1px solid #e5e7eb; border-radius: 8px; padding: 8px 10px; font-size: 13px; outline: none; }
+    .form-group input:focus, .form-group textarea:focus { border-color: #4f46e5; box-shadow: 0 0 0 3px rgba(79,70,229,0.1); }
+    .form-group textarea { resize: vertical; min-height: 36px; }
+
+    .btn-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    .btn { border: none; border-radius: 8px; padding: 10px 20px; font-size: 13px; font-weight: 600; cursor: pointer; transition: all 0.15s; }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .btn-primary { background: #4f46e5; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #4338ca; }
+    .btn-success { background: #16a34a; color: white; }
+    .btn-success:hover:not(:disabled) { background: #15803d; }
+    .btn-danger { background: #ef4444; color: white; }
+    .btn-danger:hover:not(:disabled) { background: #dc2626; }
+    .btn-outline { background: white; color: #374151; border: 1px solid #e5e7eb; }
+    .btn-outline:hover:not(:disabled) { background: #f9fafb; }
+
+    /* ── Progress ── */
+    .progress-bar { height: 6px; background: #e5e7eb; border-radius: 3px; overflow: hidden; margin-top: 12px; }
+    .progress-fill { height: 100%; background: #4f46e5; transition: width 0.3s; border-radius: 3px; }
+    .progress-text { font-size: 12px; color: #6b7280; margin-top: 6px; }
+
+    /* ── Table ── */
+    .table-card { background: white; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); overflow: hidden; }
+    .table-header { padding: 14px 20px; border-bottom: 1px solid #f3f4f6; display: flex; justify-content: space-between; align-items: center; }
+    .table-header h2 { font-size: 14px; font-weight: 700; }
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th { background: #f9fafb; padding: 10px 14px; text-align: left; font-size: 10px; font-weight: 700; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; white-space: nowrap; border-bottom: 1px solid #f3f4f6; }
+    td { padding: 10px 14px; border-bottom: 1px solid #f9fafb; vertical-align: top; }
+    tr:hover { background: #f9fafb; }
+    a { color: #4f46e5; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .social-links { display: flex; gap: 6px; }
+    .social-links a { font-weight: 600; font-size: 11px; }
+    .social-li { color: #0A66C2; }
+    .social-fb { color: #1877F2; }
+    .social-ig { color: #E4405F; }
+    .social-tw { color: #1DA1F2; }
+    .tag-yes { background: #dcfce7; color: #16a34a; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+    .tag-no { background: #f3f4f6; color: #9ca3af; padding: 2px 8px; border-radius: 10px; font-size: 10px; font-weight: 600; }
+    .tag-unknown { color: #d1d5db; }
+    .truncate { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>LinkedEngage Research</h1>
+    <div class="stats">
+      <div><span class="stat-num" id="statFound">0</span> found</div>
+      <div><span class="stat-num" id="statScraped">0</span> scraped</div>
+      <div><span class="stat-num" id="statFounders">0</span> founders</div>
+    </div>
+  </div>
+
+  <div class="container">
+    <!-- Search form -->
+    <div class="form-card">
+      <div class="form-row">
+        <div class="form-group" style="flex:2">
+          <label>Industry / Business Type</label>
+          <input id="industry" placeholder="e.g. Solar installation, Plumbing, Dental clinic" />
+        </div>
+        <div class="form-group" style="flex:1.5">
+          <label>Location</label>
+          <input id="location" placeholder="e.g. Auckland, New Zealand" />
+        </div>
+        <div class="form-group" style="flex:1">
+          <label>Max Companies</label>
+          <input id="maxCompanies" type="number" value="30" min="5" max="100" />
+        </div>
+      </div>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Additional Keywords (optional, comma-separated)</label>
+          <input id="keywords" placeholder="e.g. residential, commercial, repair" />
+        </div>
+        <div class="form-group">
+          <label>Exclude (optional, comma-separated)</label>
+          <input id="exclude" placeholder="e.g. franchise, directory" />
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-primary" id="startBtn">Start Research</button>
+        <button class="btn btn-danger" id="stopBtn" style="display:none">Stop</button>
+        <button class="btn btn-success" id="exportBtn" style="display:none">Export CSV</button>
+        <button class="btn btn-outline" id="clearBtn" style="display:none">Clear Results</button>
+        <span id="statusText" style="font-size:12px;color:#6b7280;margin-left:8px;"></span>
+      </div>
+      <div class="progress-bar" id="progressBar" style="display:none">
+        <div class="progress-fill" id="progressFill" style="width:0%"></div>
+      </div>
+      <div class="progress-text" id="progressText" style="display:none"></div>
+    </div>
+
+    <!-- Results -->
+    <div class="table-card" id="resultsCard" style="display:none">
+      <div class="table-header">
+        <h2>Results (<span id="resultCount">0</span>)</h2>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Company</th>
+              <th>Website</th>
+              <th>Socials</th>
+              <th>Email</th>
+              <th>Phone</th>
+              <th>Founder / CEO</th>
+              <th>Founder LinkedIn</th>
+              <th>Google Ads</th>
+              <th>Meta Ads</th>
+              <th>Location</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script src="research.js"></script>
+</body>
+</html>

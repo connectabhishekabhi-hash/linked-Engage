@@ -145,6 +145,12 @@ disconnectBtn.addEventListener("click", async () => {
   showMessage("Token cleared. Paste a new API token to reconnect.", "success");
 });
 
+// ── Research button ──────────────────────────────────────────────────────────
+document.getElementById("researchBtn").addEventListener("click", () => {
+  chrome.tabs.create({ url: chrome.runtime.getURL("research.html") });
+  window.close();
+});
+
 // ── Init ─────────────────────────────────────────────────────────────────────
 loadStatus();
 setInterval(loadStatus, 3000);
