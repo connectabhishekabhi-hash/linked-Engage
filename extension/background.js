@@ -2691,16 +2691,15 @@ function extractCommentsFromPost(csrfToken) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// RESEARCH ENGINE — Browser-based company discovery and analysis
+// RESEARCH ENGINE v2 — Lean scraper, minimal AI
+// Flow: Google search → Scrape websites (social links, emails, phones) →
+//       Check ads → Find founder LinkedIn
 // ═══════════════════════════════════════════════════════════════════════════════
 
 let researchBusy = false;
 
 async function pollAndProcessResearch() {
-  if (researchBusy) {
-    console.log("[research] Busy — skipping poll");
-    return;
-  }
+  if (researchBusy) return;
 
   const token = await getStoredToken();
   if (!token) return;
@@ -2726,7 +2725,6 @@ async function pollAndProcessResearch() {
         await handleCheckAds(job);
         break;
       default:
-        console.warn(`[research] Unknown job type: ${job.type}`);
         await failResearchJob(job.id, `Unknown job type: ${job.type}`);
     }
   } catch (err) {
@@ -2736,20 +2734,21 @@ async function pollAndProcessResearch() {
   }
 }
 
-// ── Helper: random delay for human-like behavior ────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function randomDelay(minMs, maxMs) {
   return new Promise(resolve => setTimeout(resolve, minMs + Math.random() * (maxMs - minMs)));
 }
 
-// ── Helper: open tab, wait for load, extract content, close tab ─────────────
-
-async function openAndExtract(url, extractFn, timeoutMs = 30000) {
+async function openAndExtract(url, extractFn, timeoutMs = 25000) {
   let tab;
   try {
     tab = await chrome.tabs.create({ url, active: false });
     await new Promise((resolve, reject) => {
-      const timeout = setTimeout(() => reject(new Error("Page load timeout")), timeoutMs);
+      const timeout = setTimeout(() => {
+        chrome.tabs.onUpdated.removeListener(listener);
+        resolve(); // don't reject — try extracting anyway
+      }, timeoutMs);
       const listener = (tabId, info) => {
         if (tabId === tab.id && info.status === "complete") {
           chrome.tabs.onUpdated.removeListener(listener);
@@ -2760,7 +2759,7 @@ async function openAndExtract(url, extractFn, timeoutMs = 30000) {
       chrome.tabs.onUpdated.addListener(listener);
     });
 
-    await randomDelay(2000, 4000);
+    await randomDelay(1500, 3000);
 
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
@@ -2778,20 +2777,15 @@ async function openAndExtract(url, extractFn, timeoutMs = 30000) {
 // ═══ DISCOVER_COMPANIES ═════════════════════════════════════════════════════
 
 async function handleDiscoverCompanies(job) {
-  const { query, maxResults = 15 } = job.payload;
-  console.log(`[research] Discovering companies: "${query}"`);
+  const { query, maxResults = 20 } = job.payload;
+  console.log(`[research] Discovering: "${query}"`);
 
   try {
     const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}&num=${maxResults}`;
     const results = await openAndExtract(searchUrl, extractGoogleResults);
 
-    if (!results || !results.length) {
-      await completeResearchJob(job.id, { companies: [] });
-      return;
-    }
-
-    console.log(`[research] Found ${results.length} search results for "${query}"`);
-    await completeResearchJob(job.id, { companies: results });
+    console.log(`[research] Google returned ${results?.length ?? 0} results for "${query}"`);
+    await completeResearchJob(job.id, { companies: results || [] });
   } catch (err) {
     console.error(`[research] DISCOVER error:`, err);
     await failResearchJob(job.id, err.message);
@@ -2800,27 +2794,50 @@ async function handleDiscoverCompanies(job) {
 
 function extractGoogleResults() {
   const results = [];
-  const items = document.querySelectorAll("div.g, div[data-hveid]");
+  const blocked = ["google.com","youtube.com","wikipedia.org","facebook.com",
+    "linkedin.com","twitter.com","instagram.com","tiktok.com","reddit.com",
+    "pinterest.com","amazon.com","yelp.com","bbb.org","glassdoor.com",
+    "indeed.com","crunchbase.com"];
 
-  for (const item of items) {
-    const linkEl = item.querySelector("a[href^='http']");
-    const titleEl = item.querySelector("h3");
-    const snippetEl = item.querySelector("[data-sncf], .VwiC3b, [style*='-webkit-line-clamp']");
+  // Strategy 1: standard organic results
+  document.querySelectorAll("div.g").forEach(item => {
+    const a = item.querySelector("a[href^='http']");
+    const h3 = item.querySelector("h3");
+    if (!a || !h3) return;
+    try {
+      const hostname = new URL(a.href).hostname.replace(/^www\./, "");
+      if (blocked.some(b => hostname.endsWith(b))) return;
+      results.push({ name: h3.textContent.trim(), url: a.href, website: `https://${hostname}` });
+    } catch {}
+  });
 
-    if (!linkEl || !titleEl) continue;
+  // Strategy 2: broader — any link with an h3 ancestor
+  if (results.length < 3) {
+    document.querySelectorAll("a[href^='http']").forEach(a => {
+      const h3 = a.closest("[data-hveid]")?.querySelector("h3") || a.querySelector("h3");
+      if (!h3) return;
+      try {
+        const hostname = new URL(a.href).hostname.replace(/^www\./, "");
+        if (blocked.some(b => hostname.endsWith(b))) return;
+        if (results.some(r => r.website === `https://${hostname}`)) return;
+        results.push({ name: h3.textContent.trim(), url: a.href, website: `https://${hostname}` });
+      } catch {}
+    });
+  }
 
-    const url = linkEl.href;
-    if (!url || url.includes("google.com") || url.includes("youtube.com") || url.includes("wikipedia.org")) continue;
-
-    let domain;
-    try { domain = new URL(url).hostname.replace(/^www\./, ""); } catch { continue; }
-
-    results.push({
-      name: titleEl.textContent.trim(),
-      url: url,
-      website: `https://${domain}`,
-      snippet: snippetEl?.textContent?.trim() || "",
-      sourceUrl: window.location.href,
+  // Strategy 3: extract ALL external links as fallback
+  if (results.length < 3) {
+    document.querySelectorAll("a[href^='http']").forEach(a => {
+      try {
+        const hostname = new URL(a.href).hostname.replace(/^www\./, "");
+        if (blocked.some(b => hostname.endsWith(b))) return;
+        if (hostname.includes("google")) return;
+        if (results.some(r => r.website === `https://${hostname}`)) return;
+        const text = a.textContent?.trim();
+        if (text && text.length > 2 && text.length < 100) {
+          results.push({ name: text, url: a.href, website: `https://${hostname}` });
+        }
+      } catch {}
     });
   }
 
@@ -2828,199 +2845,163 @@ function extractGoogleResults() {
   const seen = new Set();
   return results.filter(r => {
     try {
-      const d = new URL(r.url).hostname.replace(/^www\./, "");
+      const d = new URL(r.website).hostname;
       if (seen.has(d)) return false;
       seen.add(d);
       return true;
     } catch { return false; }
-  });
+  }).slice(0, 20);
 }
 
-// ═══ EXTRACT_WEBSITE ════════════════════════════════════════════════════════
+// ═══ EXTRACT_WEBSITE — scrapes social links, emails, phones ═════════════════
 
 async function handleExtractWebsite(job) {
   const { website } = job.payload;
-  if (!website) {
-    await failResearchJob(job.id, "No website URL provided");
-    return;
-  }
+  if (!website) { await failResearchJob(job.id, "No website"); return; }
 
-  console.log(`[research] Extracting website: ${website}`);
+  console.log(`[research] Scraping: ${website}`);
 
   try {
-    // Visit homepage
-    const homepage = await openAndExtract(website, extractPageContent);
-    await randomDelay(1500, 3000);
+    const data = await openAndExtract(website, scrapeWebsite);
+    if (!data) { await failResearchJob(job.id, "Could not scrape website"); return; }
 
-    // Try to find and visit About page
-    let aboutContent = null;
-    if (homepage?.internalLinks) {
-      const aboutLink = homepage.internalLinks.find(l =>
-        /about|who-we-are|our-story|company/i.test(l)
-      );
-      if (aboutLink) {
-        aboutContent = await openAndExtract(aboutLink, extractPageContent);
-        await randomDelay(1500, 3000);
+    // Try contact page for more emails/phones
+    if (data.contactPageUrl) {
+      await randomDelay(1000, 2000);
+      const contactData = await openAndExtract(data.contactPageUrl, scrapeWebsite);
+      if (contactData) {
+        // Merge emails and phones
+        for (const e of contactData.emails || []) {
+          if (!data.emails.includes(e)) data.emails.push(e);
+        }
+        for (const p of contactData.phones || []) {
+          if (!data.phones.includes(p)) data.phones.push(p);
+        }
+        if (contactData.address && !data.address) data.address = contactData.address;
       }
-    }
-
-    // Try to find and visit Services page
-    let servicesContent = null;
-    if (homepage?.internalLinks) {
-      const servicesLink = homepage.internalLinks.find(l =>
-        /services|solutions|what-we-do|offerings/i.test(l)
-      );
-      if (servicesLink) {
-        servicesContent = await openAndExtract(servicesLink, extractPageContent);
-        await randomDelay(1500, 3000);
-      }
-    }
-
-    // Try Contact page for location
-    let contactContent = null;
-    if (homepage?.internalLinks) {
-      const contactLink = homepage.internalLinks.find(l =>
-        /contact|location|find-us/i.test(l)
-      );
-      if (contactLink) {
-        contactContent = await openAndExtract(contactLink, extractPageContent);
-      }
-    }
-
-    // Build structured result
-    const content = {
-      homepage: homepage?.text?.slice(0, 3000) || "",
-      about: aboutContent?.text?.slice(0, 2000) || "",
-      services: servicesContent?.text?.slice(0, 2000) || "",
-      contact: contactContent?.text?.slice(0, 1000) || "",
-    };
-
-    // Extract structured data from homepage
-    const services = extractServicesFromContent(content);
-    const location = extractLocationFromContent(content);
-
-    const evidence = [];
-    if (location) {
-      evidence.push({ field: "location", value: location, sourceUrl: website, confidence: "INFERRED" });
-    }
-    for (const svc of services.slice(0, 5)) {
-      evidence.push({ field: "service", value: svc, sourceUrl: website, confidence: "VERIFIED" });
     }
 
     await completeResearchJob(job.id, {
-      content,
-      services,
-      location,
-      estimatedSize: null,
-      evidence,
+      website,
+      socials: data.socials,
+      emails: data.emails,
+      phones: data.phones,
+      services: data.services,
+      location: data.address || null,
+      content: { title: data.title, description: data.description },
     });
 
-    console.log(`[research] Extracted website: ${website} (${services.length} services found)`);
+    console.log(`[research] Scraped ${website}: ${Object.values(data.socials).filter(Boolean).length} socials, ${data.emails.length} emails`);
   } catch (err) {
     console.error(`[research] EXTRACT error:`, err);
     await failResearchJob(job.id, err.message);
   }
 }
 
-function extractPageContent() {
+function scrapeWebsite() {
+  const html = document.documentElement?.innerHTML || "";
   const text = document.body?.innerText?.slice(0, 5000) || "";
   const title = document.title || "";
-  const metaDesc = document.querySelector('meta[name="description"]')?.content || "";
+  const description = document.querySelector('meta[name="description"]')?.content || "";
 
-  // Collect internal links
-  const origin = window.location.origin;
-  const links = [...document.querySelectorAll("a[href]")]
-    .map(a => a.href)
-    .filter(h => h.startsWith(origin) || h.startsWith("/"))
-    .map(h => h.startsWith("/") ? origin + h : h)
-    .filter((v, i, a) => a.indexOf(v) === i)
-    .slice(0, 30);
-
-  // Check for conversion elements
-  const hasForms = document.querySelectorAll("form").length;
-  const hasPhoneCta = !!document.body?.innerHTML?.match(/tel:/i);
-  const hasQuoteForm = !!text.match(/free quote|get a quote|request.*quote|free estimate/i);
-
-  return {
-    text,
-    title,
-    metaDesc,
-    internalLinks: links,
-    forms: hasForms,
-    hasPhoneCta,
-    hasQuoteForm,
+  // ── Extract social media links ──
+  const allLinks = [...document.querySelectorAll("a[href]")].map(a => a.href);
+  const socials = {
+    linkedin: null,
+    facebook: null,
+    instagram: null,
+    twitter: null,
+    youtube: null,
+    tiktok: null,
   };
-}
 
-function extractServicesFromContent(content) {
-  const allText = `${content.homepage} ${content.services} ${content.about}`.toLowerCase();
-  const servicePatterns = [
-    /(?:we (?:offer|provide|specialize|do)|our services|services include)[:\s]*([\s\S]{10,200}?)(?:\.|$)/gi,
-  ];
-  const found = new Set();
-  for (const pattern of servicePatterns) {
-    const match = allText.match(pattern);
-    if (match) {
-      match[0].split(/[,\n•·]/).forEach(s => {
-        const trimmed = s.replace(/we offer|we provide|our services|services include/gi, "").trim();
-        if (trimmed.length > 3 && trimmed.length < 60) found.add(trimmed);
-      });
+  for (const href of allLinks) {
+    if (!socials.linkedin && /linkedin\.com\/(company|in)\//i.test(href))
+      socials.linkedin = href.split("?")[0];
+    if (!socials.facebook && /facebook\.com\/(?!sharer|share|tr|ads)/i.test(href))
+      socials.facebook = href.split("?")[0];
+    if (!socials.instagram && /instagram\.com\//i.test(href) && !/instagram\.com\/(p|explore|accounts)/i.test(href))
+      socials.instagram = href.split("?")[0];
+    if (!socials.twitter && /(twitter\.com|x\.com)\//i.test(href) && !/\/intent\//i.test(href))
+      socials.twitter = href.split("?")[0];
+    if (!socials.youtube && /youtube\.com\/(channel|c|@|user)\//i.test(href))
+      socials.youtube = href.split("?")[0];
+    if (!socials.tiktok && /tiktok\.com\/@/i.test(href))
+      socials.tiktok = href.split("?")[0];
+  }
+
+  // ── Extract emails ──
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const rawEmails = (html.match(emailRegex) || []);
+  const emails = [...new Set(rawEmails)]
+    .filter(e => !e.endsWith(".png") && !e.endsWith(".jpg") && !e.endsWith(".svg")
+      && !e.includes("example") && !e.includes("wixpress") && !e.includes("sentry"));
+
+  // ── Extract phone numbers ──
+  const phoneRegex = /(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/g;
+  const telLinks = allLinks.filter(h => h.startsWith("tel:")).map(h => h.replace("tel:", "").trim());
+  const textPhones = (text.match(phoneRegex) || []).filter(p => p.replace(/\D/g, "").length >= 7 && p.replace(/\D/g, "").length <= 15);
+  const phones = [...new Set([...telLinks, ...textPhones])].slice(0, 5);
+
+  // ── Extract services (simple keyword extraction) ──
+  const services = [];
+  const navLinks = [...document.querySelectorAll("nav a, header a, [role='navigation'] a")]
+    .map(a => a.textContent?.trim())
+    .filter(t => t && t.length > 2 && t.length < 40);
+  const serviceKeywords = navLinks.filter(t => /service|solution|product|what we do/i.test(t));
+  if (serviceKeywords.length) services.push(...serviceKeywords);
+
+  // ── Find contact page URL ──
+  const origin = window.location.origin;
+  let contactPageUrl = null;
+  for (const a of document.querySelectorAll("a[href]")) {
+    if (/contact|get-in-touch|reach-us/i.test(a.href) && (a.href.startsWith(origin) || a.href.startsWith("/"))) {
+      contactPageUrl = a.href.startsWith("/") ? origin + a.href : a.href;
+      break;
     }
   }
-  return [...found].slice(0, 10);
-}
 
-function extractLocationFromContent(content) {
-  const allText = `${content.contact} ${content.homepage} ${content.about}`;
-  // Look for US state + city patterns
-  const stateMatch = allText.match(/(?:located|serving|based)\s+in\s+([^.]{3,50})/i);
-  if (stateMatch) return stateMatch[1].trim();
-  // Look for address patterns
-  const addressMatch = allText.match(/(\d+[^,]+,\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?,\s*[A-Z]{2}\s*\d{5})/);
-  if (addressMatch) return addressMatch[1].trim();
-  return null;
+  // ── Extract address ──
+  let address = null;
+  const addrMatch = text.match(/(\d+[^,\n]{3,40},\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,?\s*[A-Z]{2}\s*\d{4,5})/);
+  if (addrMatch) address = addrMatch[1].trim();
+  if (!address) {
+    const locMatch = text.match(/(?:located|based|serving)\s+(?:in|at)\s+([^.\n]{3,50})/i);
+    if (locMatch) address = locMatch[1].trim();
+  }
+
+  return { title, description, socials, emails: emails.slice(0, 5), phones, services, contactPageUrl, address };
 }
 
 // ═══ FIND_DECISION_MAKER ════════════════════════════════════════════════════
 
 async function handleFindDecisionMaker(job) {
   const { companyName, domain } = job.payload;
-  console.log(`[research] Finding decision maker for: ${companyName}`);
+  console.log(`[research] Finding founder for: ${companyName}`);
 
   try {
     const candidates = [];
 
-    // Search 1: Company + Founder/CEO
-    const q1 = `"${companyName}" founder OR CEO OR owner site:linkedin.com/in`;
-    const results1 = await openAndExtract(
-      `https://www.google.com/search?q=${encodeURIComponent(q1)}&num=5`,
+    // Single Google search for founder/CEO on LinkedIn
+    const q = `"${companyName}" founder OR CEO OR owner site:linkedin.com/in`;
+    const results = await openAndExtract(
+      `https://www.google.com/search?q=${encodeURIComponent(q)}&num=5`,
       extractPeopleFromGoogle
     );
-    if (results1) candidates.push(...results1.map(r => ({ ...r, source: "google_ceo_search" })));
+    if (results?.length) candidates.push(...results);
 
-    await randomDelay(2000, 4000);
-
-    // Search 2: Company + Marketing Director
-    const q2 = `"${companyName}" "marketing director" OR "head of marketing" OR CMO site:linkedin.com/in`;
-    const results2 = await openAndExtract(
-      `https://www.google.com/search?q=${encodeURIComponent(q2)}&num=5`,
-      extractPeopleFromGoogle
-    );
-    if (results2) candidates.push(...results2.map(r => ({ ...r, source: "google_marketing_search" })));
-
-    await randomDelay(1500, 3000);
-
-    // Search 3: Company name + LinkedIn (broader)
-    if (candidates.length === 0) {
-      const q3 = `"${companyName}" ${domain || ""} site:linkedin.com/in`;
-      const results3 = await openAndExtract(
-        `https://www.google.com/search?q=${encodeURIComponent(q3)}&num=5`,
+    // Fallback: broader search if nothing found
+    if (candidates.length === 0 && domain) {
+      await randomDelay(1500, 2500);
+      const q2 = `"${companyName}" ${domain} site:linkedin.com/in`;
+      const results2 = await openAndExtract(
+        `https://www.google.com/search?q=${encodeURIComponent(q2)}&num=5`,
         extractPeopleFromGoogle
       );
-      if (results3) candidates.push(...results3.map(r => ({ ...r, source: "google_broad_search" })));
+      if (results2?.length) candidates.push(...results2);
     }
 
-    console.log(`[research] Found ${candidates.length} candidate contacts for ${companyName}`);
+    console.log(`[research] Found ${candidates.length} candidates for ${companyName}`);
     await completeResearchJob(job.id, { candidates });
   } catch (err) {
     console.error(`[research] FIND_DM error:`, err);
@@ -3030,106 +3011,106 @@ async function handleFindDecisionMaker(job) {
 
 function extractPeopleFromGoogle() {
   const results = [];
-  const items = document.querySelectorAll("div.g, div[data-hveid]");
 
-  for (const item of items) {
-    const linkEl = item.querySelector("a[href*='linkedin.com/in/']");
-    const titleEl = item.querySelector("h3");
-    const snippetEl = item.querySelector("[data-sncf], .VwiC3b, [style*='-webkit-line-clamp']");
+  // Strategy 1: div.g with linkedin links
+  document.querySelectorAll("div.g").forEach(item => {
+    const a = item.querySelector("a[href*='linkedin.com/in/']");
+    const h3 = item.querySelector("h3");
+    if (!a || !h3) return;
 
-    if (!linkEl || !titleEl) continue;
-
-    const url = linkEl.href;
-    const titleText = titleEl.textContent.trim();
-    const snippet = snippetEl?.textContent?.trim() || "";
-
-    // Parse LinkedIn title format: "Name - Title - Company | LinkedIn"
+    const titleText = h3.textContent.trim();
     const parts = titleText.split(/\s*[-–|]\s*/);
-    const name = parts[0] || "";
-    const title = parts[1] || "";
-
-    if (!name || name.length < 2) continue;
 
     results.push({
-      name: name.trim(),
-      title: title.trim(),
-      linkedinUrl: url.split("?")[0],
+      name: (parts[0] || "").trim(),
+      title: (parts[1] || "").trim(),
+      linkedinUrl: a.href.split("?")[0],
+    });
+  });
+
+  // Strategy 2: any linkedin links with nearby text
+  if (results.length === 0) {
+    document.querySelectorAll("a[href*='linkedin.com/in/']").forEach(a => {
+      const text = a.closest("[data-hveid]")?.querySelector("h3")?.textContent
+        || a.textContent?.trim() || "";
+      if (text.length < 3) return;
+      const parts = text.split(/\s*[-–|]\s*/);
+      results.push({
+        name: (parts[0] || "").trim(),
+        title: (parts[1] || "").trim(),
+        linkedinUrl: a.href.split("?")[0],
+      });
     });
   }
 
-  return results;
+  return results.filter(r => r.name.length > 1);
 }
 
 // ═══ CHECK_ADS ══════════════════════════════════════════════════════════════
 
 async function handleCheckAds(job) {
   const { companyName, domain } = job.payload;
-  console.log(`[research] Checking ads for: ${companyName} (${domain})`);
+  console.log(`[research] Checking ads for: ${companyName}`);
 
   try {
-    // Check Meta Ad Library
-    let metaResult = { status: "UNKNOWN", evidence: null };
-    try {
-      const metaUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=US&q=${encodeURIComponent(companyName)}`;
-      const metaData = await openAndExtract(metaUrl, extractMetaAdResults);
-      await randomDelay(2000, 3000);
-
-      if (metaData && metaData.adsFound > 0) {
-        metaResult = { status: "OBSERVED", evidence: `${metaData.adsFound} active ads found in Meta Ad Library` };
-      } else if (metaData && metaData.adsFound === 0) {
-        metaResult = { status: "NO_EVIDENCE", evidence: "No active ads found in Meta Ad Library" };
-      }
-    } catch {
-      metaResult = { status: "UNKNOWN", evidence: "Could not check Meta Ad Library" };
-    }
-
-    // Check for Google Ads signals on the company website
+    // Check website for Google Ads / Meta Pixel tags
     let googleResult = { status: "UNKNOWN", evidence: null };
+    let metaResult = { status: "UNKNOWN", evidence: null };
+
     if (domain) {
       try {
-        const siteData = await openAndExtract(`https://${domain}`, extractAdSignals);
-        await randomDelay(1500, 2500);
+        const signals = await openAndExtract(`https://${domain}`, extractAdSignals);
+        if (signals) {
+          if (signals.hasGoogleAdsTag) {
+            googleResult = { status: "LIKELY", evidence: "Google Ads tag found" };
+          } else if (signals.hasGTM) {
+            googleResult = { status: "LIKELY", evidence: "Google Tag Manager found" };
+          } else {
+            googleResult = { status: "NO_EVIDENCE", evidence: "No Google Ads tags" };
+          }
 
-        if (siteData?.hasGoogleAdsTag) {
-          googleResult = { status: "LIKELY", evidence: "Google Ads conversion tag or gtag found on website" };
-        } else if (siteData?.hasGTM) {
-          googleResult = { status: "LIKELY", evidence: "Google Tag Manager found (may be used for ads tracking)" };
-        } else {
-          googleResult = { status: "NO_EVIDENCE", evidence: "No Google Ads tags detected on website" };
+          if (signals.hasMetaPixel) {
+            metaResult = { status: "LIKELY", evidence: "Meta Pixel found on website" };
+          } else {
+            metaResult = { status: "NO_EVIDENCE", evidence: "No Meta Pixel found" };
+          }
         }
-      } catch {
-        googleResult = { status: "UNKNOWN", evidence: "Could not check website for ad signals" };
-      }
+      } catch {}
     }
 
-    await completeResearchJob(job.id, {
-      googleAds: googleResult,
-      metaAds: metaResult,
-    });
+    // Check Meta Ad Library
+    if (metaResult.status !== "LIKELY") {
+      try {
+        await randomDelay(1000, 2000);
+        const metaUrl = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=${encodeURIComponent(companyName)}`;
+        const metaData = await openAndExtract(metaUrl, extractMetaAdResults);
+        if (metaData?.adsFound > 0) {
+          metaResult = { status: "OBSERVED", evidence: `${metaData.adsFound} active ads in Meta Ad Library` };
+        } else if (metaData) {
+          metaResult = { status: "NO_EVIDENCE", evidence: "No ads in Meta Ad Library" };
+        }
+      } catch {}
+    }
 
-    console.log(`[research] Ads check done for ${companyName}: Google=${googleResult.status}, Meta=${metaResult.status}`);
+    await completeResearchJob(job.id, { googleAds: googleResult, metaAds: metaResult });
+    console.log(`[research] Ads: ${companyName} — Google=${googleResult.status}, Meta=${metaResult.status}`);
   } catch (err) {
-    console.error(`[research] CHECK_ADS error:`, err);
     await failResearchJob(job.id, err.message);
   }
 }
 
-function extractMetaAdResults() {
-  const text = document.body?.innerText || "";
-  // Check for "No ads match" or similar
-  if (/no ads match|no results/i.test(text)) return { adsFound: 0 };
-  // Count ad cards
-  const adCards = document.querySelectorAll("[class*='_7jvw'], [class*='ad-card'], [data-testid*='ad']");
-  if (adCards.length > 0) return { adsFound: adCards.length };
-  // Fallback: look for ad preview elements
-  const previews = document.querySelectorAll("div[class*='x1lliihq']");
-  return { adsFound: previews.length > 2 ? previews.length : 0 };
-}
-
 function extractAdSignals() {
   const html = document.documentElement?.innerHTML || "";
-  const hasGoogleAdsTag = /googleads|google_conversion|AW-\d+|gtag.*conversion/i.test(html);
-  const hasGTM = /googletagmanager|GTM-[A-Z0-9]+/i.test(html);
-  const hasMetaPixel = /fbq\(|facebook\.com\/tr|Meta Pixel/i.test(html);
-  return { hasGoogleAdsTag, hasGTM, hasMetaPixel };
+  return {
+    hasGoogleAdsTag: /googleads|google_conversion|AW-\d+|gtag.*conversion/i.test(html),
+    hasGTM: /googletagmanager|GTM-[A-Z0-9]+/i.test(html),
+    hasMetaPixel: /fbq\(|facebook\.com\/tr|Meta Pixel/i.test(html),
+  };
+}
+
+function extractMetaAdResults() {
+  const text = document.body?.innerText || "";
+  if (/no ads match|no results|0 results/i.test(text)) return { adsFound: 0 };
+  const cards = document.querySelectorAll("[class*='_7jvw'], [data-testid*='ad']");
+  return { adsFound: cards.length };
 }

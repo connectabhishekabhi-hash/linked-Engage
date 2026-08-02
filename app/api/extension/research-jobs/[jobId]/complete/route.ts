@@ -2,7 +2,6 @@ export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-import { qualifyCompany, analyzeWebsite, generateOpportunity, selectDecisionMaker } from "@/lib/ai-research";
 
 export async function POST(req: NextRequest, { params }: { params: Promise<{ jobId: string }> }) {
   try {
@@ -21,13 +20,11 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ job
     });
     if (!job) return NextResponse.json({ error: "Job not found" }, { status: 404 });
 
-    // Mark completed
     await (prisma as any).researchJob.update({
       where: { id: jobId },
       data: { status: "COMPLETED", result: body.result ?? {}, completedAt: new Date() },
     });
 
-    // Process results based on job type
     switch (job.type) {
       case "DISCOVER_COMPANIES":
         await handleDiscoveryResults(job, body.result);
@@ -54,9 +51,11 @@ export async function POST(req: NextRequest, { params }: { params: Promise<{ job
 
 async function handleDiscoveryResults(job: any, result: any) {
   const companies = result?.companies ?? [];
-  if (!companies.length) return;
+  if (!companies.length) {
+    await checkStageComplete(job.campaignId, "DISCOVER_COMPANIES", "RESEARCHING", createExtractJobs);
+    return;
+  }
 
-  let created = 0;
   for (const c of companies) {
     const domain = extractDomain(c.website || c.url || "");
     if (!domain) continue;
@@ -66,24 +65,20 @@ async function handleDiscoveryResults(job: any, result: any) {
         where: { campaignId_domain: { campaignId: job.campaignId, domain } },
         create: {
           campaignId: job.campaignId,
-          name: c.name || c.title || domain,
+          name: c.name || domain,
           domain,
-          website: c.website || c.url || `https://${domain}`,
-          location: c.location || null,
-          description: c.description || c.snippet || null,
+          website: `https://${domain}`,
+          description: c.snippet || null,
           sourceUrl: c.sourceUrl || null,
-          sourceSnippet: c.snippet || null,
           researchStatus: "DISCOVERED",
         },
         update: {},
       });
-      created++;
     } catch {
-      // duplicate domain — skip
+      // duplicate — skip
     }
   }
 
-  // Update campaign counter
   const totalFound = await (prisma as any).researchCompany.count({
     where: { campaignId: job.campaignId },
   });
@@ -92,32 +87,31 @@ async function handleDiscoveryResults(job: any, result: any) {
     data: { companiesFound: totalFound },
   });
 
-  // Check if all discovery jobs are done — if so, create EXTRACT_WEBSITE jobs
-  const pendingDiscovery = await (prisma as any).researchJob.count({
-    where: { campaignId: job.campaignId, type: "DISCOVER_COMPANIES", status: { in: ["PENDING", "CLAIMED"] } },
+  await checkStageComplete(job.campaignId, "DISCOVER_COMPANIES", "RESEARCHING", createExtractJobs);
+}
+
+async function createExtractJobs(campaignId: string) {
+  const discovered = await (prisma as any).researchCompany.findMany({
+    where: { campaignId, researchStatus: "DISCOVERED" },
+    select: { id: true, website: true, domain: true },
   });
 
-  if (pendingDiscovery === 0) {
-    const discovered = await (prisma as any).researchCompany.findMany({
-      where: { campaignId: job.campaignId, researchStatus: "DISCOVERED" },
-      select: { id: true, website: true },
+  if (discovered.length === 0) {
+    await (prisma as any).researchCampaign.update({
+      where: { id: campaignId },
+      data: { status: "COMPLETED" },
     });
-
-    if (discovered.length > 0) {
-      const extractJobs = discovered.map((c: any) => ({
-        campaignId: job.campaignId,
-        companyId: c.id,
-        type: "EXTRACT_WEBSITE",
-        status: "PENDING",
-        payload: { website: c.website },
-      }));
-      await (prisma as any).researchJob.createMany({ data: extractJobs });
-      await (prisma as any).researchCampaign.update({
-        where: { id: job.campaignId },
-        data: { status: "RESEARCHING" },
-      });
-    }
+    return;
   }
+
+  const jobs = discovered.map((c: any) => ({
+    campaignId,
+    companyId: c.id,
+    type: "EXTRACT_WEBSITE",
+    status: "PENDING",
+    payload: { website: c.website, domain: c.domain },
+  }));
+  await (prisma as any).researchJob.createMany({ data: jobs });
 }
 
 // ── EXTRACT_WEBSITE ─────────────────────────────────────────────────────────
@@ -125,94 +119,89 @@ async function handleDiscoveryResults(job: any, result: any) {
 async function handleExtractionResults(job: any, result: any) {
   if (!job.companyId) return;
 
-  const content = result?.content ?? {};
-  const services = result?.services ?? [];
-  const location = result?.location || null;
-  const estimatedSize = result?.estimatedSize || null;
-
   await (prisma as any).researchCompany.update({
     where: { id: job.companyId },
     data: {
-      extractedContent: content,
-      servicesOffered: services,
-      location: location,
-      estimatedSize: estimatedSize,
+      extractedContent: result?.content ?? null,
+      servicesOffered: result?.services ?? [],
+      location: result?.location || null,
+      estimatedSize: result?.estimatedSize || null,
       researchStatus: "EXTRACTED",
+      // Store social links and contact info in extractedContent
     },
   });
 
-  // Store evidence
-  if (result?.evidence) {
-    const evidenceData = result.evidence.map((e: any) => ({
-      companyId: job.companyId,
-      field: e.field,
-      value: e.value,
-      sourceUrl: e.sourceUrl || null,
-      confidence: e.confidence || "VERIFIED",
-    }));
-    await (prisma as any).companyEvidence.createMany({ data: evidenceData });
+  // Store social links as evidence
+  const evidence: any[] = [];
+  if (result?.socials) {
+    for (const [platform, url] of Object.entries(result.socials)) {
+      if (url) {
+        evidence.push({
+          companyId: job.companyId,
+          field: `social_${platform}`,
+          value: url as string,
+          sourceUrl: result?.website || job.payload?.website,
+          confidence: "VERIFIED",
+        });
+      }
+    }
   }
-
-  // Check if all extractions done — trigger qualification
-  const pendingExtract = await (prisma as any).researchJob.count({
-    where: { campaignId: job.campaignId, type: "EXTRACT_WEBSITE", status: { in: ["PENDING", "CLAIMED"] } },
-  });
-
-  if (pendingExtract === 0) {
-    await runQualification(job.campaignId);
-  }
-}
-
-// ── AI QUALIFICATION (server-side, no extension needed) ─────────────────────
-
-async function runQualification(campaignId: string) {
-  const campaign = await (prisma as any).researchCampaign.findUnique({ where: { id: campaignId } });
-  if (!campaign) return;
-
-  await (prisma as any).researchCampaign.update({
-    where: { id: campaignId },
-    data: { status: "QUALIFYING" },
-  });
-
-  const companies = await (prisma as any).researchCompany.findMany({
-    where: { campaignId, researchStatus: "EXTRACTED" },
-  });
-
-  let qualified = 0;
-  for (const company of companies) {
-    try {
-      const result = await qualifyCompany(company, campaign);
-      await (prisma as any).researchCompany.update({
-        where: { id: company.id },
-        data: {
-          qualificationStatus: result.status,
-          qualificationScore: result.score,
-          qualificationReason: result.reason,
-          researchStatus: result.status === "DISQUALIFIED" ? "DISQUALIFIED" : "QUALIFIED",
-        },
-      });
-      if (result.status === "QUALIFIED" || result.status === "MAYBE") qualified++;
-    } catch (err: any) {
-      console.error(`[qualify] Error for ${company.name}:`, err.message);
-      await (prisma as any).researchCompany.update({
-        where: { id: company.id },
-        data: { researchStatus: "FAILED", errorMessage: err.message },
+  if (result?.emails?.length) {
+    for (const email of result.emails) {
+      evidence.push({
+        companyId: job.companyId,
+        field: "email",
+        value: email,
+        sourceUrl: result?.website || job.payload?.website,
+        confidence: "VERIFIED",
       });
     }
   }
+  if (result?.phones?.length) {
+    for (const phone of result.phones) {
+      evidence.push({
+        companyId: job.companyId,
+        field: "phone",
+        value: phone,
+        sourceUrl: result?.website || job.payload?.website,
+        confidence: "VERIFIED",
+      });
+    }
+  }
+  if (evidence.length > 0) {
+    await (prisma as any).companyEvidence.createMany({ data: evidence });
+  }
 
-  await (prisma as any).researchCampaign.update({
-    where: { id: campaignId },
-    data: { companiesQualified: qualified },
-  });
+  // When all extractions done → create CHECK_ADS + FIND_DECISION_MAKER jobs
+  await checkStageComplete(job.campaignId, "EXTRACT_WEBSITE", "FINDING_CONTACTS", createRefineJobs);
+}
 
-  // Create FIND_DECISION_MAKER + CHECK_ADS jobs for qualified companies
-  const qualifiedCompanies = await (prisma as any).researchCompany.findMany({
-    where: { campaignId, qualificationStatus: { in: ["QUALIFIED", "MAYBE"] } },
+async function createRefineJobs(campaignId: string) {
+  const companies = await (prisma as any).researchCompany.findMany({
+    where: { campaignId, researchStatus: "EXTRACTED" },
     select: { id: true, name: true, domain: true },
   });
 
-  const dmJobs = qualifiedCompanies.map((c: any) => ({
+  if (companies.length === 0) {
+    await (prisma as any).researchCampaign.update({
+      where: { id: campaignId },
+      data: { status: "COMPLETED" },
+    });
+    return;
+  }
+
+  // Mark all extracted companies as QUALIFIED (no AI gate — everything goes through)
+  await (prisma as any).researchCompany.updateMany({
+    where: { campaignId, researchStatus: "EXTRACTED" },
+    data: { qualificationStatus: "QUALIFIED", qualificationScore: 100, researchStatus: "QUALIFIED" },
+  });
+
+  await (prisma as any).researchCampaign.update({
+    where: { id: campaignId },
+    data: { companiesQualified: companies.length },
+  });
+
+  const dmJobs = companies.map((c: any) => ({
     campaignId,
     companyId: c.id,
     type: "FIND_DECISION_MAKER",
@@ -220,7 +209,7 @@ async function runQualification(campaignId: string) {
     payload: { companyName: c.name, domain: c.domain },
   }));
 
-  const adsJobs = qualifiedCompanies.map((c: any) => ({
+  const adsJobs = companies.map((c: any) => ({
     campaignId,
     companyId: c.id,
     type: "CHECK_ADS",
@@ -228,18 +217,7 @@ async function runQualification(campaignId: string) {
     payload: { companyName: c.name, domain: c.domain },
   }));
 
-  if (dmJobs.length > 0) {
-    await (prisma as any).researchJob.createMany({ data: [...dmJobs, ...adsJobs] });
-    await (prisma as any).researchCampaign.update({
-      where: { id: campaignId },
-      data: { status: "FINDING_CONTACTS" },
-    });
-  } else {
-    await (prisma as any).researchCampaign.update({
-      where: { id: campaignId },
-      data: { status: "COMPLETED" },
-    });
-  }
+  await (prisma as any).researchJob.createMany({ data: [...dmJobs, ...adsJobs] });
 }
 
 // ── FIND_DECISION_MAKER ─────────────────────────────────────────────────────
@@ -248,43 +226,33 @@ async function handleDecisionMakerResults(job: any, result: any) {
   if (!job.companyId) return;
 
   const candidates = result?.candidates ?? [];
-  const company = await (prisma as any).researchCompany.findUnique({
-    where: { id: job.companyId },
-  });
 
-  if (candidates.length > 0 && company) {
-    const aiResult = await selectDecisionMaker(candidates, company.name);
-    if (aiResult.selected) {
-      await (prisma as any).companyContact.create({
-        data: {
-          companyId: job.companyId,
-          fullName: aiResult.selected.name,
-          title: aiResult.selected.title,
-          linkedinUrl: aiResult.selected.linkedinUrl || null,
-          source: "google_search",
-          confidence: aiResult.selected.confidence,
-          isPrimary: true,
-        },
-      });
+  // Pick the best candidate without AI — prioritize by title
+  const selected = pickBestCandidate(candidates);
 
-      // Update campaign counter
-      const totalContacts = await (prisma as any).companyContact.count({
-        where: { company: { campaignId: job.campaignId }, isPrimary: true },
-      });
-      await (prisma as any).researchCampaign.update({
-        where: { id: job.campaignId },
-        data: { contactsFound: totalContacts },
-      });
-    }
+  if (selected) {
+    await (prisma as any).companyContact.create({
+      data: {
+        companyId: job.companyId,
+        fullName: selected.name,
+        title: selected.title,
+        linkedinUrl: selected.linkedinUrl || null,
+        source: "google_search",
+        confidence: "HIGH",
+        isPrimary: true,
+      },
+    });
+
+    const totalContacts = await (prisma as any).companyContact.count({
+      where: { company: { campaignId: job.campaignId }, isPrimary: true },
+    });
+    await (prisma as any).researchCampaign.update({
+      where: { id: job.campaignId },
+      data: { contactsFound: totalContacts },
+    });
   }
 
-  await (prisma as any).researchCompany.update({
-    where: { id: job.companyId },
-    data: { researchStatus: "CHECKING_ADS" },
-  });
-
-  // Check if all DM + ADS jobs done — trigger analysis
-  await checkAndTriggerAnalysis(job.campaignId);
+  await checkStageComplete(job.campaignId, "FIND_DECISION_MAKER", null, () => checkAllRefineComplete(job.campaignId));
 }
 
 // ── CHECK_ADS ───────────────────────────────────────────────────────────────
@@ -303,13 +271,11 @@ async function handleAdsResults(job: any, result: any) {
     },
   });
 
-  await checkAndTriggerAnalysis(job.campaignId);
+  await checkStageComplete(job.campaignId, "CHECK_ADS", null, () => checkAllRefineComplete(job.campaignId));
 }
 
-// ── Analysis trigger (runs after DM + ADS both complete) ────────────────────
-
-async function checkAndTriggerAnalysis(campaignId: string) {
-  const pendingDmAds = await (prisma as any).researchJob.count({
+async function checkAllRefineComplete(campaignId: string) {
+  const pendingRefine = await (prisma as any).researchJob.count({
     where: {
       campaignId,
       type: { in: ["FIND_DECISION_MAKER", "CHECK_ADS"] },
@@ -317,67 +283,68 @@ async function checkAndTriggerAnalysis(campaignId: string) {
     },
   });
 
-  if (pendingDmAds > 0) return;
+  if (pendingRefine === 0) {
+    // Mark all qualified companies as COMPLETED
+    await (prisma as any).researchCompany.updateMany({
+      where: { campaignId, qualificationStatus: { in: ["QUALIFIED", "MAYBE"] } },
+      data: { researchStatus: "COMPLETED" },
+    });
 
-  // All DM + ADS done — run website analysis + opportunity generation (server-side AI)
-  const campaign = await (prisma as any).researchCampaign.findUnique({ where: { id: campaignId } });
-  if (!campaign) return;
-
-  await (prisma as any).researchCampaign.update({
-    where: { id: campaignId },
-    data: { status: "ANALYZING" },
-  });
-
-  const companies = await (prisma as any).researchCompany.findMany({
-    where: { campaignId, qualificationStatus: { in: ["QUALIFIED", "MAYBE"] } },
-  });
-
-  for (const company of companies) {
-    try {
-      const analysis = await analyzeWebsite(company, campaign.industry);
-      await (prisma as any).researchCompany.update({
-        where: { id: company.id },
-        data: {
-          websiteStrengths: analysis.strengths,
-          websiteWeaknesses: analysis.weaknesses,
-          conversionIssues: analysis.conversionIssues,
-          websiteAnalyzedAt: new Date(),
-        },
-      });
-
-      const merged = {
-        ...company,
-        websiteStrengths: analysis.strengths,
-        websiteWeaknesses: analysis.weaknesses,
-        conversionIssues: analysis.conversionIssues,
-      };
-      const opp = await generateOpportunity(merged);
-      await (prisma as any).researchCompany.update({
-        where: { id: company.id },
-        data: {
-          opportunity: opp.opportunity,
-          opportunityEvidence: opp.evidence,
-          researchStatus: "COMPLETED",
-        },
-      });
-    } catch (err: any) {
-      console.error(`[analysis] Error for ${company.name}:`, err.message);
-    }
+    await (prisma as any).researchCampaign.update({
+      where: { id: campaignId },
+      data: { status: "COMPLETED" },
+    });
   }
-
-  await (prisma as any).researchCampaign.update({
-    where: { id: campaignId },
-    data: { status: "COMPLETED" },
-  });
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+async function checkStageComplete(
+  campaignId: string,
+  jobType: string,
+  nextStatus: string | null,
+  onComplete: (campaignId: string) => Promise<void>
+) {
+  const pending = await (prisma as any).researchJob.count({
+    where: { campaignId, type: jobType, status: { in: ["PENDING", "CLAIMED"] } },
+  });
+
+  if (pending === 0) {
+    if (nextStatus) {
+      await (prisma as any).researchCampaign.update({
+        where: { id: campaignId },
+        data: { status: nextStatus },
+      });
+    }
+    await onComplete(campaignId);
+  }
+}
+
+function pickBestCandidate(candidates: any[]): any | null {
+  if (!candidates.length) return null;
+
+  const priorityTitles = [
+    /founder/i, /co-founder/i, /ceo/i, /owner/i, /president/i,
+    /director/i, /managing/i, /chief/i, /head/i, /vp/i,
+  ];
+
+  for (const pattern of priorityTitles) {
+    const match = candidates.find((c: any) => pattern.test(c.title));
+    if (match) return match;
+  }
+
+  return candidates[0];
+}
 
 function extractDomain(url: string): string | null {
   try {
     if (!url.includes("://")) url = "https://" + url;
     const hostname = new URL(url).hostname.replace(/^www\./, "");
-    if (hostname === "google.com" || hostname === "facebook.com" || hostname === "linkedin.com" || hostname === "yelp.com") return null;
+    const blocked = ["google.com", "facebook.com", "linkedin.com", "yelp.com",
+      "youtube.com", "wikipedia.org", "twitter.com", "instagram.com", "tiktok.com",
+      "reddit.com", "pinterest.com", "amazon.com", "bbb.org", "glassdoor.com",
+      "indeed.com", "crunchbase.com", "bloomberg.com"];
+    if (blocked.some(b => hostname.endsWith(b))) return null;
     return hostname || null;
   } catch {
     return null;

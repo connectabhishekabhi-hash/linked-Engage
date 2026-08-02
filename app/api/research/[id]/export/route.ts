@@ -23,24 +23,31 @@ export async function GET(
       return NextResponse.json({ error: "Campaign not found" }, { status: 404 });
 
     const companies = await (prisma as any).researchCompany.findMany({
-      where: { campaignId: id, qualificationStatus: { in: ["QUALIFIED", "MAYBE"] } },
-      include: { contacts: { where: { isPrimary: true }, take: 1 } },
-      orderBy: { qualificationScore: "desc" },
+      where: { campaignId: id },
+      include: {
+        contacts: { where: { isPrimary: true }, take: 1 },
+        evidence: true,
+      },
+      orderBy: { createdAt: "asc" },
     });
 
     const escape = (val: string | null | undefined): string => {
       if (!val) return "";
-      const str = val.replace(/"/g, '""');
-      return `"${str}"`;
+      return `"${val.replace(/"/g, '""')}"`;
     };
 
+    const getSocial = (evidence: any[], platform: string) =>
+      evidence.find((e: any) => e.field === `social_${platform}`)?.value || "";
+
+    const getField = (evidence: any[], field: string) =>
+      evidence.filter((e: any) => e.field === field).map((e: any) => e.value).join("; ");
+
     const headers = [
-      "Company Name", "Website", "City/Location", "Estimated Size",
-      "Qualification Score", "Qualification Status",
-      "Decision Maker", "Decision Maker Title", "Decision Maker LinkedIn",
-      "Google Ads", "Meta Ads",
-      "Services", "Marketing Opportunity",
-      "Website Strengths", "Website Weaknesses",
+      "Company Name", "Website", "Location",
+      "LinkedIn", "Facebook", "Instagram", "Twitter",
+      "Email", "Phone",
+      "Founder Name", "Founder Title", "Founder LinkedIn",
+      "Google Ads", "Meta Ads", "Status",
     ];
 
     const rows = companies.map((c: any) => {
@@ -49,18 +56,18 @@ export async function GET(
         escape(c.name),
         escape(c.website),
         escape(c.location),
-        escape(c.estimatedSize),
-        c.qualificationScore?.toString() ?? "",
-        escape(c.qualificationStatus),
+        escape(getSocial(c.evidence, "linkedin")),
+        escape(getSocial(c.evidence, "facebook")),
+        escape(getSocial(c.evidence, "instagram")),
+        escape(getSocial(c.evidence, "twitter")),
+        escape(getField(c.evidence, "email")),
+        escape(getField(c.evidence, "phone")),
         escape(contact?.fullName),
         escape(contact?.title),
         escape(contact?.linkedinUrl),
         escape(c.googleAdsStatus),
         escape(c.metaAdsStatus),
-        escape(c.servicesOffered?.join("; ")),
-        escape(c.opportunity),
-        escape(c.websiteStrengths?.join("; ")),
-        escape(c.websiteWeaknesses?.join("; ")),
+        escape(c.researchStatus),
       ].join(",");
     });
 

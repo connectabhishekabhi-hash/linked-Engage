@@ -24,31 +24,36 @@ interface Campaign {
   companySize:  string | null;
   status:       ResearchStatus;
   targetCount:  number;
+  companiesFound: number;
+  companiesQualified: number;
+  contactsFound: number;
   createdAt:    string;
 }
 
 interface Contact {
   id:          string;
-  name:        string;
+  fullName:    string;
   title:       string;
   linkedinUrl: string | null;
-  email:       string | null;
+  isPrimary:   boolean;
+}
+
+interface Evidence {
+  field: string;
+  value: string;
 }
 
 interface Company {
-  id:            string;
-  name:          string;
-  website:       string | null;
-  location:      string | null;
-  size:          string | null;
-  score:         number | null;
-  opportunity:   string | null;
-  status:        string;
-  googleAds:     boolean | null;
-  metaAds:       boolean | null;
-  websiteResearched: boolean;
-  qualified:     boolean;
-  contacts:      Contact[];
+  id:              string;
+  name:            string;
+  domain:          string | null;
+  website:         string | null;
+  location:        string | null;
+  researchStatus:  string;
+  googleAdsStatus: string | null;
+  metaAdsStatus:   string | null;
+  contacts:        Contact[];
+  evidence:        Evidence[];
 }
 
 interface JobStats {
@@ -94,44 +99,57 @@ function StatusBadge({ status }: { status: ResearchStatus }) {
   );
 }
 
-// ── Running statuses (for polling) ───────────────────────────────────────────
 const RUNNING_STATUSES: ResearchStatus[] = [
-  "DISCOVERING",
-  "RESEARCHING",
-  "QUALIFYING",
-  "FINDING_CONTACTS",
-  "ANALYZING",
+  "DISCOVERING", "RESEARCHING", "QUALIFYING", "FINDING_CONTACTS", "ANALYZING",
 ];
 
-// ── Stage progress component ─────────────────────────────────────────────────
-function StageRow({
-  label,
-  current,
-  total,
-  icon,
-}: {
-  label: string;
-  current: number;
-  total: number | null;
-  icon: React.ReactNode;
-}) {
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+function getSocial(evidence: Evidence[], platform: string): string | null {
+  return evidence.find(e => e.field === `social_${platform}`)?.value ?? null;
+}
+
+function getEmails(evidence: Evidence[]): string[] {
+  return evidence.filter(e => e.field === "email").map(e => e.value);
+}
+
+function getPhones(evidence: Evidence[]): string[] {
+  return evidence.filter(e => e.field === "phone").map(e => e.value);
+}
+
+function SocialIcon({ url, platform }: { url: string | null; platform: string }) {
+  if (!url) return <span className="text-gray-200">-</span>;
+  const colors: Record<string, string> = {
+    linkedin: "text-[#0A66C2]", facebook: "text-[#1877F2]",
+    instagram: "text-[#E4405F]", twitter: "text-gray-800",
+  };
+  return (
+    <a href={url} target="_blank" rel="noopener noreferrer"
+      className={`${colors[platform] || "text-indigo-500"} hover:opacity-70 text-xs font-medium`}
+      onClick={e => e.stopPropagation()}>
+      {platform.charAt(0).toUpperCase() + platform.slice(1, 2)}
+    </a>
+  );
+}
+
+function AdsTag({ status }: { status: string | null }) {
+  if (!status || status === "UNKNOWN") return <span className="text-gray-300">--</span>;
+  if (status === "LIKELY" || status === "OBSERVED")
+    return <span className="text-green-600 text-xs font-medium">Yes</span>;
+  return <span className="text-gray-400 text-xs">No</span>;
+}
+
+// ── Progress row ─────────────────────────────────────────────────────────────
+function StageRow({ label, current, total }: { label: string; current: number; total: number | null }) {
   const pct = total && total > 0 ? Math.round((current / total) * 100) : current > 0 ? 100 : 0;
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-1">
       <div className="flex items-center justify-between text-xs">
-        <span className="flex items-center gap-1.5 text-gray-600 font-medium">
-          {icon}
-          {label}
-        </span>
-        <span className="text-gray-400 font-mono">
-          {total !== null ? `${current}/${total}` : current}
-        </span>
+        <span className="text-gray-600 font-medium">{label}</span>
+        <span className="text-gray-400 font-mono">{total !== null ? `${current}/${total}` : current}</span>
       </div>
       <div className="h-1.5 bg-gray-100 rounded-full overflow-hidden">
-        <div
-          className="h-full bg-indigo-500 rounded-full transition-all duration-500"
-          style={{ width: `${Math.min(pct, 100)}%` }}
-        />
+        <div className="h-full bg-indigo-500 rounded-full transition-all duration-500" style={{ width: `${Math.min(pct, 100)}%` }} />
       </div>
     </div>
   );
@@ -152,7 +170,6 @@ export default function ResearchDetailPage() {
   const [addingOutreach, setAddingOutreach] = useState<Record<string, boolean>>({});
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  // Fetch campaign data
   const fetchData = useCallback(async () => {
     try {
       const res  = await fetch(`/api/research/${campaignId}`);
@@ -171,10 +188,8 @@ export default function ResearchDetailPage() {
     }
   }, [campaignId]);
 
-  // Initial load
   useEffect(() => { fetchData(); }, [fetchData]);
 
-  // Polling while running
   useEffect(() => {
     if (campaign && RUNNING_STATUSES.includes(campaign.status)) {
       intervalRef.current = setInterval(fetchData, 5000);
@@ -182,12 +197,9 @@ export default function ResearchDetailPage() {
       clearInterval(intervalRef.current);
       intervalRef.current = null;
     }
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
+    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [campaign?.status, fetchData]);
 
-  // Action handlers
   const handleAction = async (action: string, method: string = "PATCH") => {
     setActionMsg("");
     try {
@@ -212,62 +224,45 @@ export default function ResearchDetailPage() {
 
   const handleStart = () => handleAction("start", "POST");
 
-  // Export CSV
   const handleExport = async () => {
     const res = await fetch(`/api/research/${campaignId}/export`);
-    if (!res.ok) {
-      setActionMsg("Export failed");
-      return;
-    }
+    if (!res.ok) { setActionMsg("Export failed"); return; }
     const blob = await res.blob();
     const url  = URL.createObjectURL(blob);
     const a    = document.createElement("a");
-    a.href     = url;
-    a.download = `research-${campaignId}.csv`;
-    a.click();
+    a.href = url; a.download = `research-${campaignId}.csv`; a.click();
     URL.revokeObjectURL(url);
   };
 
-  // Add to outreach
   const handleAddToOutreach = async (companyId: string, contactId: string) => {
-    setAddingOutreach((p) => ({ ...p, [companyId]: true }));
+    setAddingOutreach(p => ({ ...p, [companyId]: true }));
     try {
       const res = await fetch(`/api/research/${campaignId}/company/${companyId}`, {
-        method:  "POST",
+        method: "POST",
         headers: { "Content-Type": "application/json" },
-        body:    JSON.stringify({ contactId }),
+        body: JSON.stringify({ contactId }),
       });
       if (res.ok) {
         setActionMsg("Added to outreach");
         setTimeout(() => setActionMsg(""), 3000);
       } else {
         const data = await res.json();
-        setActionMsg(data.error ?? "Failed to add to outreach");
+        setActionMsg(data.error ?? "Failed");
       }
     } catch {
       setActionMsg("Failed to add to outreach");
     } finally {
-      setAddingOutreach((p) => ({ ...p, [companyId]: false }));
+      setAddingOutreach(p => ({ ...p, [companyId]: false }));
     }
   };
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center py-20 text-sm text-gray-400">
-        Loading...
-      </div>
-    );
-  }
+  if (loading) return <div className="flex items-center justify-center py-20 text-sm text-gray-400">Loading...</div>;
 
   if (error || !campaign) {
     return (
       <div className="max-w-4xl mx-auto px-6 py-8">
-        <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-4 py-3">
-          {error || "Campaign not found"}
-        </p>
-        <Link href="/dashboard/research" className="text-sm text-indigo-600 hover:underline mt-3 inline-block">
-          Back to Research
-        </Link>
+        <p className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-xl px-4 py-3">{error || "Campaign not found"}</p>
+        <Link href="/dashboard/research" className="text-sm text-indigo-600 hover:underline mt-3 inline-block">Back to Research</Link>
       </div>
     );
   }
@@ -275,16 +270,11 @@ export default function ResearchDetailPage() {
   const isRunning = RUNNING_STATUSES.includes(campaign.status);
 
   return (
-    <div className="max-w-5xl mx-auto px-6 py-8 space-y-6">
-      {/* Breadcrumb + header */}
+    <div className="max-w-6xl mx-auto px-6 py-8 space-y-6">
+      {/* Header */}
       <div>
-        <Link
-          href="/dashboard/research"
-          className="text-xs text-gray-400 hover:text-indigo-600 transition-colors flex items-center gap-1 mb-3"
-        >
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-            <polyline points="15 18 9 12 15 6" />
-          </svg>
+        <Link href="/dashboard/research" className="text-xs text-gray-400 hover:text-indigo-600 transition-colors flex items-center gap-1 mb-3">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><polyline points="15 18 9 12 15 6" /></svg>
           Back to Research
         </Link>
         <div className="flex items-start justify-between gap-4">
@@ -297,63 +287,37 @@ export default function ResearchDetailPage() {
               <span>{campaign.industry}</span>
               <span className="text-gray-200">|</span>
               <span>{campaign.location}</span>
-              {campaign.companySize && (
-                <>
-                  <span className="text-gray-200">|</span>
-                  <span>{campaign.companySize}</span>
-                </>
-              )}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
             {campaign.status === "DRAFT" && (
-              <button
-                onClick={handleStart}
-                className="rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-5 py-2 transition-colors"
-              >
+              <button onClick={handleStart} className="rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-sm font-semibold px-5 py-2 transition-colors">
                 Start Research
               </button>
             )}
             {isRunning && (
-              <button
-                onClick={() => handleAction("pause")}
-                className="rounded-xl border border-yellow-200 text-yellow-600 hover:bg-yellow-50 text-sm font-semibold px-4 py-2 transition-colors"
-              >
+              <button onClick={() => handleAction("pause")} className="rounded-xl border border-yellow-200 text-yellow-600 hover:bg-yellow-50 text-sm font-semibold px-4 py-2">
                 Pause
               </button>
             )}
             {campaign.status === "PAUSED" && (
-              <button
-                onClick={() => handleAction("resume")}
-                className="rounded-xl border border-green-200 text-green-600 hover:bg-green-50 text-sm font-semibold px-4 py-2 transition-colors"
-              >
+              <button onClick={() => handleAction("resume")} className="rounded-xl border border-green-200 text-green-600 hover:bg-green-50 text-sm font-semibold px-4 py-2">
                 Resume
               </button>
             )}
             {(isRunning || campaign.status === "PAUSED") && (
-              <button
-                onClick={() => handleAction("cancel")}
-                className="rounded-xl border border-red-200 text-red-500 hover:bg-red-50 text-sm font-semibold px-4 py-2 transition-colors"
-              >
+              <button onClick={() => handleAction("cancel")} className="rounded-xl border border-red-200 text-red-500 hover:bg-red-50 text-sm font-semibold px-4 py-2">
                 Cancel
               </button>
             )}
             {campaign.status === "FAILED" && (
-              <button
-                onClick={() => handleAction("retry_failed")}
-                className="rounded-xl border border-amber-200 text-amber-600 hover:bg-amber-50 text-sm font-semibold px-4 py-2 transition-colors"
-              >
+              <button onClick={() => handleAction("retry_failed")} className="rounded-xl border border-amber-200 text-amber-600 hover:bg-amber-50 text-sm font-semibold px-4 py-2">
                 Retry Failed
               </button>
             )}
             {companies.length > 0 && (
-              <button
-                onClick={handleExport}
-                className="rounded-xl border border-gray-200 text-gray-600 hover:bg-gray-50 text-sm font-medium px-4 py-2 transition-colors flex items-center gap-1.5"
-              >
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
-                  <path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" />
-                </svg>
+              <button onClick={handleExport} className="rounded-xl border border-gray-200 text-gray-600 hover:bg-gray-50 text-sm font-medium px-4 py-2 flex items-center gap-1.5">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4M7 10l5 5 5-5M12 15V3" /></svg>
                 Export CSV
               </button>
             )}
@@ -361,72 +325,38 @@ export default function ResearchDetailPage() {
         </div>
       </div>
 
-      {actionMsg && (
-        <p className="text-sm text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-xl px-3 py-2">
-          {actionMsg}
-        </p>
-      )}
+      {actionMsg && <p className="text-sm text-indigo-700 bg-indigo-50 border border-indigo-200 rounded-xl px-3 py-2">{actionMsg}</p>}
 
-      {/* Progress section */}
+      {/* Stats cards */}
+      <div className="grid grid-cols-4 gap-4">
+        <div className="bg-white rounded-xl border border-gray-100 p-4 text-center">
+          <p className="text-2xl font-bold text-gray-900">{campaign.companiesFound}</p>
+          <p className="text-xs text-gray-400 mt-1">Found</p>
+        </div>
+        <div className="bg-white rounded-xl border border-gray-100 p-4 text-center">
+          <p className="text-2xl font-bold text-gray-900">{campaign.companiesQualified}</p>
+          <p className="text-xs text-gray-400 mt-1">Scraped</p>
+        </div>
+        <div className="bg-white rounded-xl border border-gray-100 p-4 text-center">
+          <p className="text-2xl font-bold text-gray-900">{campaign.contactsFound}</p>
+          <p className="text-xs text-gray-400 mt-1">Founders Found</p>
+        </div>
+        <div className="bg-white rounded-xl border border-gray-100 p-4 text-center">
+          <p className="text-2xl font-bold text-indigo-600">{campaign.targetCount}</p>
+          <p className="text-xs text-gray-400 mt-1">Target</p>
+        </div>
+      </div>
+
+      {/* Progress */}
       {jobStats && (
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm p-5">
-          <h2 className="text-sm font-bold text-gray-900 mb-4">Progress</h2>
-          <div className="grid grid-cols-2 lg:grid-cols-3 gap-4">
-            <StageRow
-              label="Discovery"
-              current={jobStats.discovery.completed}
-              total={null}
-              icon={
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
-                </svg>
-              }
-            />
-            <StageRow
-              label="Website Research"
-              current={jobStats.websiteResearch.completed}
-              total={jobStats.websiteResearch.total}
-              icon={
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <circle cx="12" cy="12" r="10" /><path d="M2 12h20M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10A15.3 15.3 0 0112 2z" />
-                </svg>
-              }
-            />
-            <StageRow
-              label="Qualified"
-              current={jobStats.qualified}
-              total={campaign.targetCount}
-              icon={
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M22 11.08V12a10 10 0 11-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" />
-                </svg>
-              }
-            />
-            <StageRow
-              label="Decision Makers"
-              current={jobStats.decisionMakers.completed}
-              total={jobStats.decisionMakers.total}
-              icon={
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4-4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" />
-                </svg>
-              }
-            />
-            <StageRow
-              label="Analysis"
-              current={jobStats.analysis.completed}
-              total={jobStats.analysis.total}
-              icon={
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                  <line x1="18" y1="20" x2="18" y2="10" /><line x1="12" y1="20" x2="12" y2="4" /><line x1="6" y1="20" x2="6" y2="14" />
-                </svg>
-              }
-            />
-            <div className="flex items-center gap-2 text-xs text-gray-500">
-              <span className="font-medium">Target:</span>
-              <span className="text-indigo-600 font-bold">{campaign.targetCount}</span>
-              <span>qualified prospects</span>
-            </div>
+          <h2 className="text-sm font-bold text-gray-900 mb-4">Pipeline Progress</h2>
+          <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
+            <StageRow label="Google Search" current={jobStats.discovery.completed} total={jobStats.discovery.total || null} />
+            <StageRow label="Website Scraping" current={jobStats.websiteResearch.completed} total={jobStats.websiteResearch.total || null} />
+            <StageRow label="Scraped" current={jobStats.qualified} total={campaign.companiesFound || null} />
+            <StageRow label="Founder Search" current={jobStats.decisionMakers.completed} total={jobStats.decisionMakers.total || null} />
+            <StageRow label="Ads Check" current={jobStats.analysis.completed} total={jobStats.analysis.total || null} />
           </div>
         </div>
       )}
@@ -434,185 +364,134 @@ export default function ResearchDetailPage() {
       {/* Results table */}
       {companies.length > 0 && (
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm overflow-hidden">
-          <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between">
+          <div className="px-5 py-4 border-b border-gray-100">
             <h2 className="text-sm font-bold text-gray-900">
-              Results
-              <span className="ml-2 text-gray-400 font-normal">({companies.length})</span>
+              Results <span className="text-gray-400 font-normal">({companies.length})</span>
             </h2>
           </div>
           <div className="overflow-x-auto">
             <table className="w-full text-sm text-left">
               <thead className="bg-gray-50 border-b border-gray-100">
                 <tr>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Company</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Website</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Location</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Size</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Score</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Decision Maker</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Title</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">LinkedIn</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide whitespace-nowrap">Google Ads</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide whitespace-nowrap">Meta Ads</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Opportunity</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Status</th>
-                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase tracking-wide">Actions</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Company</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Website</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Socials</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Email</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Phone</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Founder</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase whitespace-nowrap">Google Ads</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase whitespace-nowrap">Meta Ads</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Status</th>
+                  <th className="px-4 py-3 text-xs font-semibold text-gray-500 uppercase">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-50">
-                {companies.map((co) => {
-                  const contact = co.contacts?.[0] ?? null;
+                {companies.map(co => {
+                  const contact = co.contacts?.find(c => c.isPrimary) ?? co.contacts?.[0] ?? null;
                   const isExpanded = expandedId === co.id;
-                  const canOutreach = contact?.linkedinUrl;
+                  const emails = getEmails(co.evidence || []);
+                  const phones = getPhones(co.evidence || []);
 
                   return (
                     <Fragment key={co.id}>
-                      <tr
-                        onClick={() => setExpandedId(isExpanded ? null : co.id)}
-                        className="hover:bg-gray-50 cursor-pointer transition-colors"
-                      >
+                      <tr onClick={() => setExpandedId(isExpanded ? null : co.id)} className="hover:bg-gray-50 cursor-pointer transition-colors">
                         <td className="px-4 py-3 font-medium text-gray-900 whitespace-nowrap">{co.name}</td>
-                        <td className="px-4 py-3 text-gray-500 whitespace-nowrap">
+                        <td className="px-4 py-3 whitespace-nowrap">
                           {co.website ? (
-                            <a
-                              href={co.website}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-indigo-500 hover:underline"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              {co.website.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, "")}
+                            <a href={co.website} target="_blank" rel="noopener noreferrer" className="text-indigo-500 hover:underline text-xs" onClick={e => e.stopPropagation()}>
+                              {co.domain || co.website.replace(/^https?:\/\/(www\.)?/, "").replace(/\/$/, "")}
                             </a>
-                          ) : (
-                            <span className="text-gray-300">--</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{co.location ?? "--"}</td>
-                        <td className="px-4 py-3 text-gray-500 whitespace-nowrap">{co.size ?? "--"}</td>
-                        <td className="px-4 py-3 whitespace-nowrap">
-                          {co.score !== null ? (
-                            <span className={`inline-flex items-center justify-center w-8 h-6 rounded-md text-xs font-bold ${
-                              co.score >= 80 ? "bg-green-50 text-green-700" :
-                              co.score >= 60 ? "bg-yellow-50 text-yellow-700" :
-                              "bg-gray-50 text-gray-500"
-                            }`}>
-                              {co.score}
-                            </span>
-                          ) : (
-                            <span className="text-gray-300">--</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-3 text-gray-700 whitespace-nowrap">{contact?.name ?? "--"}</td>
-                        <td className="px-4 py-3 text-gray-500 whitespace-nowrap text-xs">{contact?.title ?? "--"}</td>
-                        <td className="px-4 py-3 whitespace-nowrap">
-                          {contact?.linkedinUrl ? (
-                            <a
-                              href={contact.linkedinUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="text-indigo-500 hover:underline text-xs"
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              Profile
-                            </a>
-                          ) : (
-                            <span className="text-gray-300">--</span>
-                          )}
+                          ) : <span className="text-gray-300">--</span>}
                         </td>
                         <td className="px-4 py-3 whitespace-nowrap">
-                          {co.googleAds !== null ? (
-                            co.googleAds ? (
-                              <span className="text-green-600 text-xs font-medium">Yes</span>
-                            ) : (
-                              <span className="text-gray-400 text-xs">No</span>
-                            )
-                          ) : (
-                            <span className="text-gray-300">--</span>
-                          )}
+                          <div className="flex items-center gap-2">
+                            <SocialIcon url={getSocial(co.evidence || [], "linkedin")} platform="linkedin" />
+                            <SocialIcon url={getSocial(co.evidence || [], "facebook")} platform="facebook" />
+                            <SocialIcon url={getSocial(co.evidence || [], "instagram")} platform="instagram" />
+                            <SocialIcon url={getSocial(co.evidence || [], "twitter")} platform="twitter" />
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-gray-600 max-w-[140px] truncate">
+                          {emails.length > 0 ? emails[0] : <span className="text-gray-300">--</span>}
+                        </td>
+                        <td className="px-4 py-3 text-xs text-gray-600 whitespace-nowrap">
+                          {phones.length > 0 ? phones[0] : <span className="text-gray-300">--</span>}
                         </td>
                         <td className="px-4 py-3 whitespace-nowrap">
-                          {co.metaAds !== null ? (
-                            co.metaAds ? (
-                              <span className="text-green-600 text-xs font-medium">Yes</span>
-                            ) : (
-                              <span className="text-gray-400 text-xs">No</span>
-                            )
-                          ) : (
-                            <span className="text-gray-300">--</span>
-                          )}
+                          {contact ? (
+                            <div className="text-xs">
+                              <span className="text-gray-700 font-medium">{contact.fullName}</span>
+                              {contact.linkedinUrl && (
+                                <a href={contact.linkedinUrl} target="_blank" rel="noopener noreferrer" className="ml-1 text-[#0A66C2] hover:underline" onClick={e => e.stopPropagation()}>
+                                  in
+                                </a>
+                              )}
+                            </div>
+                          ) : <span className="text-gray-300">--</span>}
                         </td>
-                        <td className="px-4 py-3 text-gray-500 text-xs max-w-[150px] truncate">{co.opportunity ?? "--"}</td>
+                        <td className="px-4 py-3 whitespace-nowrap"><AdsTag status={co.googleAdsStatus} /></td>
+                        <td className="px-4 py-3 whitespace-nowrap"><AdsTag status={co.metaAdsStatus} /></td>
                         <td className="px-4 py-3 whitespace-nowrap">
                           <span className={`inline-flex rounded-full px-2 py-0.5 text-xs font-medium ${
-                            co.status === "completed" ? "bg-green-50 text-green-700" :
-                            co.status === "failed"    ? "bg-red-50 text-red-600" :
-                            co.status === "pending"   ? "bg-gray-50 text-gray-500" :
+                            co.researchStatus === "COMPLETED" ? "bg-green-50 text-green-700" :
+                            co.researchStatus === "FAILED" ? "bg-red-50 text-red-600" :
+                            co.researchStatus === "DISCOVERED" ? "bg-gray-50 text-gray-500" :
                             "bg-blue-50 text-blue-600"
                           }`}>
-                            {co.status}
+                            {co.researchStatus?.toLowerCase() || "pending"}
                           </span>
                         </td>
                         <td className="px-4 py-3 whitespace-nowrap">
-                          {canOutreach && (
+                          {contact?.linkedinUrl && (
                             <button
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleAddToOutreach(co.id, contact!.id);
-                              }}
+                              onClick={e => { e.stopPropagation(); handleAddToOutreach(co.id, contact.id); }}
                               disabled={addingOutreach[co.id]}
                               className="rounded-lg bg-indigo-50 text-indigo-600 hover:bg-indigo-100 text-xs font-semibold px-2.5 py-1.5 transition-colors disabled:opacity-40"
                             >
-                              {addingOutreach[co.id] ? "Adding..." : "Add to Outreach"}
+                              {addingOutreach[co.id] ? "Adding..." : "Outreach"}
                             </button>
                           )}
                         </td>
                       </tr>
                       {isExpanded && (
                         <tr className="bg-gray-50">
-                          <td colSpan={13} className="px-6 py-4">
-                            <div className="grid grid-cols-2 lg:grid-cols-3 gap-4 text-xs">
+                          <td colSpan={10} className="px-6 py-4">
+                            <div className="grid grid-cols-3 gap-6 text-xs">
                               <div>
-                                <p className="font-semibold text-gray-500 uppercase tracking-wide mb-1">Company Details</p>
-                                <p className="text-gray-700"><span className="font-medium">Name:</span> {co.name}</p>
-                                <p className="text-gray-700"><span className="font-medium">Website:</span> {co.website ?? "N/A"}</p>
-                                <p className="text-gray-700"><span className="font-medium">Location:</span> {co.location ?? "N/A"}</p>
-                                <p className="text-gray-700"><span className="font-medium">Size:</span> {co.size ?? "N/A"}</p>
-                                <p className="text-gray-700"><span className="font-medium">Score:</span> {co.score ?? "N/A"}</p>
-                                <p className="text-gray-700"><span className="font-medium">Qualified:</span> {co.qualified ? "Yes" : "No"}</p>
-                              </div>
-                              <div>
-                                <p className="font-semibold text-gray-500 uppercase tracking-wide mb-1">Advertising</p>
-                                <p className="text-gray-700"><span className="font-medium">Google Ads:</span> {co.googleAds === null ? "Unknown" : co.googleAds ? "Yes" : "No"}</p>
-                                <p className="text-gray-700"><span className="font-medium">Meta Ads:</span> {co.metaAds === null ? "Unknown" : co.metaAds ? "Yes" : "No"}</p>
-                                {co.opportunity && (
-                                  <p className="text-gray-700 mt-1"><span className="font-medium">Opportunity:</span> {co.opportunity}</p>
+                                <p className="font-semibold text-gray-500 uppercase tracking-wide mb-2">Social Links</p>
+                                {["linkedin","facebook","instagram","twitter","youtube","tiktok"].map(p => {
+                                  const url = getSocial(co.evidence || [], p);
+                                  return url ? (
+                                    <p key={p} className="text-gray-700 mb-1">
+                                      <span className="font-medium capitalize">{p}:</span>{" "}
+                                      <a href={url} target="_blank" rel="noopener noreferrer" className="text-indigo-500 hover:underline break-all">{url}</a>
+                                    </p>
+                                  ) : null;
+                                })}
+                                {!["linkedin","facebook","instagram","twitter","youtube","tiktok"].some(p => getSocial(co.evidence || [], p)) && (
+                                  <p className="text-gray-400 italic">No social links found</p>
                                 )}
                               </div>
                               <div>
-                                <p className="font-semibold text-gray-500 uppercase tracking-wide mb-1">Contacts</p>
-                                {co.contacts.length > 0 ? (
-                                  co.contacts.map((ct) => (
-                                    <div key={ct.id} className="mb-2">
-                                      <p className="text-gray-700 font-medium">{ct.name}</p>
-                                      <p className="text-gray-500">{ct.title}</p>
-                                      {ct.linkedinUrl && (
-                                        <a
-                                          href={ct.linkedinUrl}
-                                          target="_blank"
-                                          rel="noopener noreferrer"
-                                          className="text-indigo-500 hover:underline"
-                                        >
-                                          LinkedIn Profile
-                                        </a>
-                                      )}
-                                      {ct.email && (
-                                        <p className="text-gray-500">{ct.email}</p>
-                                      )}
-                                    </div>
-                                  ))
-                                ) : (
-                                  <p className="text-gray-400 italic">No contacts found yet</p>
+                                <p className="font-semibold text-gray-500 uppercase tracking-wide mb-2">Contact Info</p>
+                                {emails.map((e, i) => <p key={i} className="text-gray-700 mb-1"><span className="font-medium">Email:</span> {e}</p>)}
+                                {phones.map((p, i) => <p key={i} className="text-gray-700 mb-1"><span className="font-medium">Phone:</span> {p}</p>)}
+                                {co.location && <p className="text-gray-700 mb-1"><span className="font-medium">Location:</span> {co.location}</p>}
+                                {emails.length === 0 && phones.length === 0 && !co.location && (
+                                  <p className="text-gray-400 italic">No contact info found yet</p>
                                 )}
+                              </div>
+                              <div>
+                                <p className="font-semibold text-gray-500 uppercase tracking-wide mb-2">Decision Makers</p>
+                                {co.contacts?.length > 0 ? co.contacts.map(ct => (
+                                  <div key={ct.id} className="mb-2">
+                                    <p className="text-gray-700 font-medium">{ct.fullName}</p>
+                                    <p className="text-gray-500">{ct.title}</p>
+                                    {ct.linkedinUrl && (
+                                      <a href={ct.linkedinUrl} target="_blank" rel="noopener noreferrer" className="text-indigo-500 hover:underline">LinkedIn Profile</a>
+                                    )}
+                                  </div>
+                                )) : <p className="text-gray-400 italic">No founders found yet</p>}
                               </div>
                             </div>
                           </td>
@@ -627,21 +506,20 @@ export default function ResearchDetailPage() {
         </div>
       )}
 
-      {/* Empty results */}
+      {/* Empty state */}
       {!loading && companies.length === 0 && (
         <div className="bg-white rounded-2xl border border-gray-100 shadow-sm">
           <div className="flex flex-col items-center justify-center py-16 text-center">
             <div className="w-12 h-12 rounded-2xl bg-gray-50 flex items-center justify-center mb-3">
               <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#9ca3af" strokeWidth="1.8" strokeLinecap="round">
-                <circle cx="11" cy="11" r="8" />
-                <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
               </svg>
             </div>
             <h3 className="text-sm font-semibold text-gray-700">No results yet</h3>
             <p className="text-xs text-gray-400 mt-1">
               {campaign.status === "DRAFT"
-                ? "Start the research to begin discovering companies."
-                : "Results will appear here as the research progresses."}
+                ? "Click Start Research to begin discovering companies via Google."
+                : "Results will appear here as the extension scrapes websites."}
             </p>
           </div>
         </div>
@@ -649,4 +527,3 @@ export default function ResearchDetailPage() {
     </div>
   );
 }
-

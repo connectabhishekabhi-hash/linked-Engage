@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
 import { getServerSession } from "next-auth";
 import { authOptions } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { generateSearchQueries } from "@/lib/ai-research";
+// Template-based search queries — no AI tokens needed
 
 export async function GET(_req: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -22,8 +22,8 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
 
     const companies = await (prisma as any).researchCompany.findMany({
       where: { campaignId: id },
-      include: { contacts: true },
-      orderBy: [{ qualificationScore: "desc" }, { createdAt: "asc" }],
+      include: { contacts: true, evidence: true },
+      orderBy: [{ createdAt: "asc" }],
     });
 
     let jobs: any[] = [];
@@ -53,7 +53,7 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
       websiteResearch: countByType("EXTRACT_WEBSITE"),
       qualified: qualifiedCount,
       decisionMakers: countByType("FIND_DECISION_MAKER"),
-      analysis: countByType("ANALYZE_WEBSITE"),
+      analysis: countByType("CHECK_ADS"),
     };
 
     return NextResponse.json({ campaign, companies, jobStats });
@@ -81,16 +81,8 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
     if (campaign.status !== "DRAFT" && campaign.status !== "PAUSED")
       return NextResponse.json({ error: "Campaign already running or completed" }, { status: 400 });
 
-    // Generate search queries using AI
-    const queries = await generateSearchQueries({
-      industry: campaign.industry,
-      location: campaign.location,
-      companySize: campaign.companySize,
-      services: campaign.services,
-      exclusions: campaign.exclusions,
-      targetCount: campaign.targetCount,
-      additionalInstructions: campaign.additionalInstructions,
-    });
+    // Generate search queries from templates — zero AI tokens
+    const queries = generateSearchQueries(campaign);
 
     // Create DISCOVER_COMPANIES jobs for each query
     const jobData = queries.map((query: string) => ({
@@ -188,4 +180,28 @@ export async function DELETE(_req: NextRequest, { params }: { params: Promise<{ 
     console.error("[research/id] DELETE error:", err);
     return NextResponse.json({ error: err?.message ?? "Failed to delete campaign" }, { status: 500 });
   }
+}
+
+// ── Template-based search query generator (zero AI tokens) ──────────────────
+
+function generateSearchQueries(campaign: any): string[] {
+  const { industry, location, services = [], exclusions = [] } = campaign;
+  const queries: string[] = [];
+
+  const excludePart = exclusions.length > 0
+    ? " " + exclusions.map((e: string) => `-"${e}"`).join(" ")
+    : "";
+
+  queries.push(`${industry} companies in ${location}${excludePart}`);
+  queries.push(`best ${industry} ${location}${excludePart}`);
+  queries.push(`${industry} services ${location}${excludePart}`);
+  queries.push(`top ${industry} businesses ${location}${excludePart}`);
+  queries.push(`${industry} agency ${location}${excludePart}`);
+  queries.push(`${industry} providers near ${location}${excludePart}`);
+
+  for (const svc of services.slice(0, 4)) {
+    queries.push(`${svc} ${location}${excludePart}`);
+  }
+
+  return queries.slice(0, 10);
 }
