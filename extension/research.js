@@ -1,7 +1,7 @@
 /**
- * research.js — Fully local research engine
- * Runs entirely in the browser, no server dependency.
- * Google search → scrape websites → find founders → check ads → CSV export
+ * research.js — Fully local research engine v2
+ * Google search (with pagination) → scrape websites → find founders via LinkedIn company page →
+ * check Google Ads Transparency → check Facebook Ads Library → CSV export
  */
 
 // ── State ────────────────────────────────────────────────────────────────────
@@ -87,7 +87,7 @@ function esc(str) {
 
 // ── Tab helper: open → wait for load → extract → close ──────────────────────
 
-async function openAndExtract(url, extractFn, timeoutMs = 20000) {
+async function openAndExtract(url, extractFn, timeoutMs = 25000) {
   let tab;
   try {
     tab = await chrome.tabs.create({ url, active: false });
@@ -105,7 +105,7 @@ async function openAndExtract(url, extractFn, timeoutMs = 20000) {
       };
       chrome.tabs.onUpdated.addListener(listener);
     });
-    await sleep(1000 + Math.random() * 1500);
+    await sleep(1200 + Math.random() * 1300);
     const results = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: extractFn,
@@ -121,7 +121,7 @@ async function openAndExtract(url, extractFn, timeoutMs = 20000) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Step 1: Google Search ────────────────────────────────────────────────────
+// ── Step 1: Google Search (with pagination for more results) ────────────────
 
 function generateQueries(industry, location, keywords, exclude) {
   const excl = exclude.length ? " " + exclude.map(e => `-"${e}"`).join(" ") : "";
@@ -131,9 +131,15 @@ function generateQueries(industry, location, keywords, exclude) {
     `${industry} services ${location}${excl}`,
     `top ${industry} businesses ${location}${excl}`,
     `${industry} near ${location}${excl}`,
+    `${industry} providers ${location}${excl}`,
+    `${industry} contractors ${location}${excl}`,
+    `local ${industry} ${location}${excl}`,
+    `${industry} specialists ${location}${excl}`,
+    `${industry} ${location} reviews${excl}`,
   ];
-  for (const kw of keywords.slice(0, 3)) {
+  for (const kw of keywords.slice(0, 4)) {
     queries.push(`${kw} ${industry} ${location}${excl}`);
+    queries.push(`best ${kw} ${industry} ${location}${excl}`);
   }
   return queries;
 }
@@ -146,9 +152,13 @@ function extractGoogleResults() {
     "indeed.com","crunchbase.com","tripadvisor.com","tripadvisor.in",
     "lusha.com","yellowpages.com","trustpilot.com","bloomberg.com",
     "zoominfo.com","apollo.io","bing.com","canstar.co.nz","bark.com",
-    "thumbtack.com","angi.com","homeadvisor.com","nextdoor.com"];
+    "thumbtack.com","angi.com","homeadvisor.com","nextdoor.com",
+    "enfsolar.com","dnb.com","manta.com","mapquest.com","foursquare.com",
+    "hotfrog.com","cylex.com","superpages.com","whitepages.com",
+    "comparably.com","owler.com","builtwith.com","similarweb.com",
+    "g2.com","capterra.com","getapp.com","softwareadvice.com",
+    "ea.govt.nz","govt.nz","gov.au","gov.uk","gov.in"];
 
-  // Strategy 1: div.g organic results
   document.querySelectorAll("div.g").forEach(item => {
     const a = item.querySelector("a[href^='http']");
     const h3 = item.querySelector("h3");
@@ -160,7 +170,6 @@ function extractGoogleResults() {
     } catch {}
   });
 
-  // Strategy 2: any link with h3
   if (results.length < 5) {
     document.querySelectorAll("a[href^='http']").forEach(a => {
       const h3 = a.closest("[data-hveid]")?.querySelector("h3") || a.querySelector("h3");
@@ -174,7 +183,6 @@ function extractGoogleResults() {
     });
   }
 
-  // Strategy 3: all external links
   if (results.length < 5) {
     document.querySelectorAll("a[href^='http']").forEach(a => {
       try {
@@ -190,7 +198,6 @@ function extractGoogleResults() {
     });
   }
 
-  // Deduplicate
   const seen = new Set();
   return results.filter(r => {
     if (seen.has(r.domain)) return false;
@@ -206,38 +213,52 @@ function scrapeWebsite() {
   const text = document.body?.innerText?.slice(0, 5000) || "";
   const title = document.title || "";
 
-  // Social links
   const allLinks = [...document.querySelectorAll("a[href]")].map(a => a.href);
   const socials = { linkedin: null, facebook: null, instagram: null, twitter: null, youtube: null, tiktok: null };
+  let fbPageName = null;
+  let igUsername = null;
 
   for (const href of allLinks) {
-    if (!socials.linkedin && /linkedin\.com\/(company|in)\//i.test(href)) socials.linkedin = href.split("?")[0];
-    if (!socials.facebook && /facebook\.com\/(?!sharer|share|tr|ads)/i.test(href)) socials.facebook = href.split("?")[0];
-    if (!socials.instagram && /instagram\.com\//i.test(href) && !/\/(p|explore|accounts)/i.test(href)) socials.instagram = href.split("?")[0];
+    if (!socials.linkedin && /linkedin\.com\/company\//i.test(href)) {
+      socials.linkedin = href.split("?")[0];
+    }
+    if (!socials.facebook && /facebook\.com\/(?!sharer|share|tr|ads|plugins|dialog)/i.test(href)) {
+      socials.facebook = href.split("?")[0];
+      const fbMatch = href.match(/facebook\.com\/([a-zA-Z0-9._-]+)/);
+      if (fbMatch) fbPageName = fbMatch[1];
+    }
+    if (!socials.instagram && /instagram\.com\//i.test(href) && !/\/(p|explore|accounts|reel)/i.test(href)) {
+      socials.instagram = href.split("?")[0];
+      const igMatch = href.match(/instagram\.com\/([a-zA-Z0-9._]+)/);
+      if (igMatch) igUsername = igMatch[1];
+    }
     if (!socials.twitter && /(twitter\.com|x\.com)\//i.test(href) && !/\/intent\//i.test(href)) socials.twitter = href.split("?")[0];
     if (!socials.youtube && /youtube\.com\/(channel|c|@|user)\//i.test(href)) socials.youtube = href.split("?")[0];
     if (!socials.tiktok && /tiktok\.com\/@/i.test(href)) socials.tiktok = href.split("?")[0];
   }
 
-  // Emails
+  // Also check for LinkedIn personal profiles as fallback
+  if (!socials.linkedin) {
+    for (const href of allLinks) {
+      if (/linkedin\.com\/in\//i.test(href)) {
+        socials.linkedin = href.split("?")[0];
+        break;
+      }
+    }
+  }
+
   const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
   const emails = [...new Set(html.match(emailRegex) || [])]
     .filter(e => !e.endsWith(".png") && !e.endsWith(".jpg") && !e.endsWith(".svg")
-      && !e.includes("example") && !e.includes("wixpress") && !e.includes("sentry"))
+      && !e.includes("example") && !e.includes("wixpress") && !e.includes("sentry")
+      && !e.includes("wordpress") && !e.includes("gravatar"))
     .slice(0, 5);
 
-  // Phones
   const telLinks = allLinks.filter(h => h.startsWith("tel:")).map(h => h.replace("tel:", "").trim());
   const phoneRegex = /(?:\+?\d{1,3}[-.\s]?)?\(?\d{2,4}\)?[-.\s]?\d{3,4}[-.\s]?\d{3,4}/g;
   const textPhones = (text.match(phoneRegex) || []).filter(p => p.replace(/\D/g, "").length >= 7 && p.replace(/\D/g, "").length <= 15);
   const phones = [...new Set([...telLinks, ...textPhones])].slice(0, 3);
 
-  // Ad signals
-  const hasGoogleAds = /googleads|google_conversion|AW-\d+|gtag.*conversion/i.test(html);
-  const hasGTM = /googletagmanager|GTM-[A-Z0-9]+/i.test(html);
-  const hasMetaPixel = /fbq\(|facebook\.com\/tr|Meta Pixel/i.test(html);
-
-  // Address
   let address = null;
   const addrMatch = text.match(/(\d+[^,\n]{3,40},\s*[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*,?\s*[A-Z]{2}\s*\d{4,5})/);
   if (addrMatch) address = addrMatch[1].trim();
@@ -246,19 +267,58 @@ function scrapeWebsite() {
     if (locMatch) address = locMatch[1].trim();
   }
 
-  return { title, socials, emails, phones, googleAds: hasGoogleAds || hasGTM, metaAds: hasMetaPixel, address };
+  return { title, socials, emails, phones, address, fbPageName, igUsername };
 }
 
-// ── Step 3: Find Founder ─────────────────────────────────────────────────────
+// ── Step 3: Find Founder via LinkedIn Company People Page ───────────────────
 
-function extractLinkedInPeople() {
+function extractLinkedInCompanyPeople() {
+  const results = [];
+
+  // On LinkedIn company/people page, extract people cards
+  // LinkedIn renders employee cards with name, title, and profile link
+  document.querySelectorAll("a[href*='/in/']").forEach(a => {
+    const card = a.closest("[data-view-name]") || a.closest("li") || a.closest("div");
+    if (!card) return;
+
+    const nameEl = card.querySelector("span[dir='ltr']") || card.querySelector("[class*='name']") || a;
+    const name = nameEl?.textContent?.trim() || "";
+    if (name.length < 2 || name.length > 60) return;
+
+    const titleEl = card.querySelector("[class*='subtitle']") || card.querySelector("[class*='title']");
+    let title = titleEl?.textContent?.trim() || "";
+
+    // Also check all text content for title patterns
+    if (!title) {
+      const allText = card.textContent || "";
+      const titleMatch = allText.match(/(?:Founder|Co-founder|CEO|Owner|Director|Managing|Chief|President|CTO|COO|CFO)[^,\n]*/i);
+      if (titleMatch) title = titleMatch[0].trim();
+    }
+
+    const profileUrl = a.href?.split("?")[0] || "";
+    if (profileUrl.includes("/in/") && name) {
+      results.push({ name: name.split("\n")[0].trim(), title, linkedin: profileUrl });
+    }
+  });
+
+  // Deduplicate by LinkedIn URL
+  const seen = new Set();
+  return results.filter(r => {
+    if (seen.has(r.linkedin)) return false;
+    seen.add(r.linkedin);
+    return true;
+  });
+}
+
+function extractLinkedInPeopleFromGoogle() {
   const results = [];
 
   document.querySelectorAll("div.g").forEach(item => {
     const a = item.querySelector("a[href*='linkedin.com/in/']");
     const h3 = item.querySelector("h3");
     if (!a || !h3) return;
-    const parts = h3.textContent.trim().split(/\s*[-–|]\s*/);
+    const fullText = h3.textContent.trim();
+    const parts = fullText.split(/\s*[-–|]\s*/);
     results.push({
       name: (parts[0] || "").trim(),
       title: (parts[1] || "").trim(),
@@ -268,7 +328,7 @@ function extractLinkedInPeople() {
 
   if (results.length === 0) {
     document.querySelectorAll("a[href*='linkedin.com/in/']").forEach(a => {
-      const container = a.closest("[data-hveid]");
+      const container = a.closest("[data-hveid]") || a.parentElement;
       const text = container?.querySelector("h3")?.textContent || a.textContent?.trim() || "";
       if (text.length < 3) return;
       const parts = text.split(/\s*[-–|]\s*/);
@@ -285,12 +345,40 @@ function extractLinkedInPeople() {
 
 function pickBestFounder(candidates) {
   if (!candidates.length) return null;
-  const priority = [/founder/i, /co-founder/i, /ceo/i, /owner/i, /president/i, /director/i, /managing/i, /chief/i];
+  const priority = [/founder/i, /co-?founder/i, /\bceo\b/i, /\bowner\b/i, /\bpresident\b/i, /\bdirector\b/i, /managing\s*director/i, /\bchief\b/i, /\bcto\b/i, /\bcoo\b/i];
   for (const pat of priority) {
     const m = candidates.find(c => pat.test(c.title));
     if (m) return m;
   }
   return candidates[0];
+}
+
+// ── Step 4: Check Google Ads Transparency ───────────────────────────────────
+
+function extractGoogleAdsTransparency() {
+  const text = document.body?.innerText || "";
+  // The page shows advertiser info if ads exist, or "no results" if none
+  if (/no ads found|no results|didn't find any|0 results/i.test(text)) return false;
+  // Check for ad entries / advertiser cards
+  const hasAds = document.querySelectorAll("[class*='creative-preview'], [class*='ad-card'], [role='listitem']").length > 0;
+  if (hasAds) return true;
+  // Check for any ad content indicators
+  if (/ads? ran|advertiser|creative|this advertiser/i.test(text) && !/no ads/i.test(text)) return true;
+  return false;
+}
+
+// ── Step 5: Check Facebook Ads Library ──────────────────────────────────────
+
+function extractFacebookAdsLibrary() {
+  const text = document.body?.innerText || "";
+  // No results messaging
+  if (/no ads match|no results|0 results|didn't find/i.test(text)) return false;
+  // Look for ad cards or results
+  const adCards = document.querySelectorAll("[class*='_7jvw'], [class*='xrvj5dj'], div[role='article']");
+  if (adCards.length > 0) return true;
+  // Alternative: any mention of "started running" which indicates active ads
+  if (/started running|active/i.test(text) && !/no ads/i.test(text)) return true;
+  return false;
 }
 
 // ── Main research flow ──────────────────────────────────────────────────────
@@ -313,7 +401,7 @@ async function runResearch() {
   renderTable();
   updateStats();
 
-  // ── Phase 1: Google Search ──
+  // ── Phase 1: Google Search with pagination ──
   const queries = generateQueries(industry, location, keywords, exclude);
   const seenDomains = new Set();
 
@@ -321,49 +409,57 @@ async function runResearch() {
     if (shouldStop) break;
     if (seenDomains.size >= maxCompanies) break;
 
-    setStatus(`Searching Google (${i + 1}/${queries.length})...`);
-    setProgress(i, queries.length, "Google Search");
+    // Each query gets page 1 and page 2 (start=0, start=10)
+    for (let page = 0; page < 2; page++) {
+      if (shouldStop || seenDomains.size >= maxCompanies) break;
 
-    const url = `https://www.google.com/search?q=${encodeURIComponent(queries[i])}&num=20`;
-    const results = await openAndExtract(url, extractGoogleResults);
+      const pageLabel = page === 0 ? "" : " (page 2)";
+      setStatus(`Searching Google (${i + 1}/${queries.length})${pageLabel}...`);
+      setProgress(i * 2 + page, queries.length * 2, "Google Search");
 
-    if (results?.length) {
-      for (const r of results) {
-        if (seenDomains.has(r.domain)) continue;
-        if (seenDomains.size >= maxCompanies) break;
-        seenDomains.add(r.domain);
-        companies.push({
-          name: r.name,
-          domain: r.domain,
-          website: `https://${r.domain}`,
-          socials: {},
-          emails: [],
-          phones: [],
-          founder: null,
-          googleAds: null,
-          metaAds: null,
-          location: null,
-        });
+      const start = page * 10;
+      const url = `https://www.google.com/search?q=${encodeURIComponent(queries[i])}&num=10&start=${start}`;
+      const results = await openAndExtract(url, extractGoogleResults);
+
+      if (results?.length) {
+        for (const r of results) {
+          if (seenDomains.has(r.domain)) continue;
+          if (seenDomains.size >= maxCompanies) break;
+          seenDomains.add(r.domain);
+          companies.push({
+            name: r.name,
+            domain: r.domain,
+            website: `https://${r.domain}`,
+            socials: {},
+            emails: [],
+            phones: [],
+            founder: null,
+            googleAds: null,
+            metaAds: null,
+            location: null,
+            fbPageName: null,
+            igUsername: null,
+          });
+        }
       }
+
+      stats.found = companies.length;
+      updateStats();
+      renderTable();
+      await sleep(800 + Math.random() * 1200);
     }
-
-    stats.found = companies.length;
-    updateStats();
-    renderTable();
-
-    if (i < queries.length - 1) await sleep(800 + Math.random() * 1200);
   }
 
-  setProgress(queries.length, queries.length, "Google Search");
+  setProgress(1, 1, "Google Search — Complete");
 
-  // ── Phase 2: Scrape websites + check ads (in same visit) ──
+  // ── Phase 2: Scrape websites (extract socials, emails, phones, fb/ig usernames) ──
   const BATCH_SIZE = 3;
   for (let i = 0; i < companies.length; i += BATCH_SIZE) {
     if (shouldStop) break;
 
     const batch = companies.slice(i, Math.min(i + BATCH_SIZE, companies.length));
-    setStatus(`Scraping websites (${i + 1}-${Math.min(i + BATCH_SIZE, companies.length)}/${companies.length})...`);
-    setProgress(i, companies.length, "Website Scraping + Ads Check");
+    setStatus(`Scraping websites (${Math.min(i + BATCH_SIZE, companies.length)}/${companies.length})...`);
+    setProgress(i, companies.length, "Website Scraping");
 
     const promises = batch.map(async (co) => {
       try {
@@ -372,9 +468,9 @@ async function runResearch() {
           co.socials = data.socials || {};
           co.emails = data.emails || [];
           co.phones = data.phones || [];
-          co.googleAds = data.googleAds ? "YES" : "NO";
-          co.metaAds = data.metaAds ? "YES" : "NO";
           co.location = data.address || null;
+          co.fbPageName = data.fbPageName || null;
+          co.igUsername = data.igUsername || null;
           if (data.title && (co.name.includes("|") || co.name.includes("..."))) {
             co.name = data.title.split(/[|\-–]/)[0].trim() || co.name;
           }
@@ -390,41 +486,128 @@ async function runResearch() {
     renderTable();
   }
 
-  setProgress(companies.length, companies.length, "Website Scraping");
+  setProgress(1, 1, "Website Scraping — Complete");
 
-  // ── Phase 3: Find founders (Google search for LinkedIn) ──
-  for (let i = 0; i < companies.length; i += BATCH_SIZE) {
+  // ── Phase 3: Find founders via LinkedIn company people page ──
+  for (let i = 0; i < companies.length; i++) {
     if (shouldStop) break;
 
-    const batch = companies.slice(i, Math.min(i + BATCH_SIZE, companies.length));
-    setStatus(`Finding founders (${i + 1}-${Math.min(i + BATCH_SIZE, companies.length)}/${companies.length})...`);
+    const co = companies[i];
+    setStatus(`Finding founders (${i + 1}/${companies.length}) — ${co.name}...`);
     setProgress(i, companies.length, "Founder Search");
 
-    const promises = batch.map(async (co) => {
-      try {
-        const cleanName = co.name.replace(/[|\\\/\-].*/g, "").trim();
-        const q = `"${cleanName}" founder OR CEO OR owner site:linkedin.com/in`;
+    try {
+      let founderFound = false;
+
+      // Strategy 1: If we have the company LinkedIn URL, visit its /people/ page
+      if (co.socials?.linkedin && co.socials.linkedin.includes("/company/")) {
+        const companyUrl = co.socials.linkedin.replace(/\/$/, "");
+        const peopleUrl = companyUrl + "/people/";
+        const people = await openAndExtract(peopleUrl, extractLinkedInCompanyPeople, 30000);
+        if (people?.length) {
+          co.founder = pickBestFounder(people);
+          if (co.founder) {
+            stats.founders++;
+            founderFound = true;
+          }
+        }
+      }
+
+      // Strategy 2: Google search for "[company] founder/CEO site:linkedin.com/in"
+      if (!founderFound) {
+        const cleanName = co.name.replace(/[|\\\/\-–:].*/g, "").replace(/\s+(Ltd|Inc|LLC|Pty|Limited|Corp)\.?$/i, "").trim();
+        const q = `"${cleanName}" (founder OR CEO OR "co-founder" OR owner OR director) site:linkedin.com/in`;
         const candidates = await openAndExtract(
-          `https://www.google.com/search?q=${encodeURIComponent(q)}&num=5`,
-          extractLinkedInPeople
+          `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10`,
+          extractLinkedInPeopleFromGoogle
+        );
+        if (candidates?.length) {
+          co.founder = pickBestFounder(candidates);
+          if (co.founder) {
+            stats.founders++;
+            founderFound = true;
+          }
+        }
+      }
+
+      // Strategy 3: Search Google for "[company] [location] founder OR CEO linkedin"
+      if (!founderFound) {
+        const cleanName = co.name.replace(/[|\\\/\-–:].*/g, "").trim();
+        const q = `${cleanName} ${location} founder OR CEO OR owner linkedin`;
+        const candidates = await openAndExtract(
+          `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10`,
+          extractLinkedInPeopleFromGoogle
         );
         if (candidates?.length) {
           co.founder = pickBestFounder(candidates);
           if (co.founder) stats.founders++;
         }
+      }
+    } catch (err) {
+      console.error(`[research] Founder search failed for ${co.name}:`, err);
+    }
+
+    updateStats();
+    renderTable();
+    if (i < companies.length - 1) await sleep(500 + Math.random() * 800);
+  }
+
+  setProgress(1, 1, "Founder Search — Complete");
+
+  // ── Phase 4: Check Google Ads Transparency Center ──
+  for (let i = 0; i < companies.length; i += BATCH_SIZE) {
+    if (shouldStop) break;
+
+    const batch = companies.slice(i, Math.min(i + BATCH_SIZE, companies.length));
+    setStatus(`Checking Google Ads (${Math.min(i + BATCH_SIZE, companies.length)}/${companies.length})...`);
+    setProgress(i, companies.length, "Google Ads Check");
+
+    const promises = batch.map(async (co) => {
+      try {
+        const domain = co.domain;
+        const url = `https://adstransparency.google.com/?domain=${encodeURIComponent(domain)}`;
+        const hasAds = await openAndExtract(url, extractGoogleAdsTransparency, 20000);
+        co.googleAds = hasAds ? "YES" : "NO";
       } catch (err) {
-        console.error(`[research] Founder search failed for ${co.name}:`, err);
+        console.error(`[research] Google Ads check failed for ${co.domain}:`, err);
+        co.googleAds = "NO";
       }
     });
 
     await Promise.all(promises);
     updateStats();
     renderTable();
-
-    if (i + BATCH_SIZE < companies.length) await sleep(500 + Math.random() * 1000);
   }
 
-  setProgress(companies.length, companies.length, "Founder Search");
+  setProgress(1, 1, "Google Ads Check — Complete");
+
+  // ── Phase 5: Check Facebook Ads Library ──
+  for (let i = 0; i < companies.length; i += BATCH_SIZE) {
+    if (shouldStop) break;
+
+    const batch = companies.slice(i, Math.min(i + BATCH_SIZE, companies.length));
+    setStatus(`Checking Meta Ads (${Math.min(i + BATCH_SIZE, companies.length)}/${companies.length})...`);
+    setProgress(i, companies.length, "Meta Ads Check");
+
+    const promises = batch.map(async (co) => {
+      try {
+        // Use Facebook page name or Instagram username to search Ads Library
+        const searchTerm = co.fbPageName || co.igUsername || co.name.replace(/[|\\\/\-–:].*/g, "").trim();
+        const url = `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q=${encodeURIComponent(searchTerm)}`;
+        const hasAds = await openAndExtract(url, extractFacebookAdsLibrary, 20000);
+        co.metaAds = hasAds ? "YES" : "NO";
+      } catch (err) {
+        console.error(`[research] Meta Ads check failed for ${co.name}:`, err);
+        co.metaAds = "NO";
+      }
+    });
+
+    await Promise.all(promises);
+    updateStats();
+    renderTable();
+  }
+
+  setProgress(1, 1, "Meta Ads Check — Complete");
 
   // ── Done ──
   running = false;
@@ -432,7 +615,6 @@ async function runResearch() {
   stopBtn.style.display = "none";
   setStatus(`Done! ${companies.length} companies researched.`);
 
-  // Save to chrome.storage
   chrome.storage.local.set({ researchResults: companies, researchDate: new Date().toISOString() });
 }
 
