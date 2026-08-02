@@ -51,7 +51,7 @@ export async function GET(_req: NextRequest) {
     }),
     prisma.user.findUnique({
       where: { id: session.user.id },
-      select: { apiToken: true },
+      select: { apiToken: true, extensionToken: true },
     }),
   ]);
 
@@ -69,6 +69,7 @@ export async function GET(_req: NextRequest) {
     connected: !!account?.isActive,
     account,
     apiToken,
+    extensionConnected: !!user?.extensionToken,
   });
 }
 

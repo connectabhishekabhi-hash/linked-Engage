@@ -54,6 +54,7 @@ function SettingsContent() {
   const [copied,        setCopied]        = useState(false);
   const [oauthConnected,setOauthConnected]= useState(false);
   const [oauthMemberId, setOauthMemberId] = useState<string | null>(null);
+  const [extConnected,  setExtConnected]  = useState(false);
 
   const searchParams = useSearchParams();
 
@@ -73,6 +74,7 @@ function SettingsContent() {
           setLastVerified(data.account?.lastVerifiedAt ?? null);
         }
         if (data.apiToken) setApiToken(data.apiToken);
+        if (data.extensionConnected) setExtConnected(true);
         if (data.account?.linkedinMemberId) {
           setOauthConnected(true);
           setOauthMemberId(data.account.linkedinMemberId);
@@ -267,6 +269,7 @@ function SettingsContent() {
         }
         title="Chrome Extension Token"
         subtitle="Paste into the LinkedEngage extension popup to activate it"
+        badge={extConnected ? <ConnectedBadge /> : undefined}
       >
         <p className="text-sm text-gray-500 mb-4">
           The extension uses your real browser session — no Playwright, no bans.
