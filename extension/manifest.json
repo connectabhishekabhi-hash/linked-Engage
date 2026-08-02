@@ -16,7 +16,8 @@
   "host_permissions": [
     "*://*.linkedin.com/*",
     "http://localhost:3000/*",
-    "https://*.linkedengage.app/*"
+    "https://*.linkedengage.app/*",
+    "https://*.onrender.com/*"
   ],
 
   "background": {

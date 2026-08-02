@@ -26,17 +26,34 @@ export async function GET(_req: NextRequest, { params }: { params: Promise<{ id:
       orderBy: [{ qualificationScore: "desc" }, { createdAt: "asc" }],
     });
 
-    const jobs = await (prisma as any).researchJob.findMany({
-      where: { campaignId: id },
-      select: { id: true, type: true, status: true, companyId: true, error: true },
-    });
+    let jobs: any[] = [];
+    try {
+      jobs = await (prisma as any).researchJob.findMany({
+        where: { campaignId: id },
+        select: { id: true, type: true, status: true, companyId: true, error: true },
+      });
+    } catch {
+      // Table may not exist if migration hasn't been run yet
+    }
+
+    const countByType = (type: string) => {
+      const ofType = jobs.filter((j: any) => j.type === type);
+      return {
+        total: ofType.length,
+        completed: ofType.filter((j: any) => j.status === "COMPLETED").length,
+      };
+    };
+
+    const qualifiedCount = companies.filter(
+      (c: any) => c.qualificationStatus === "QUALIFIED" || c.qualificationStatus === "MAYBE"
+    ).length;
 
     const jobStats = {
-      total: jobs.length,
-      pending: jobs.filter((j: any) => j.status === "PENDING").length,
-      running: jobs.filter((j: any) => j.status === "CLAIMED" || j.status === "RUNNING").length,
-      completed: jobs.filter((j: any) => j.status === "COMPLETED").length,
-      failed: jobs.filter((j: any) => j.status === "FAILED").length,
+      discovery: countByType("DISCOVER_COMPANIES"),
+      websiteResearch: countByType("EXTRACT_WEBSITE"),
+      qualified: qualifiedCount,
+      decisionMakers: countByType("FIND_DECISION_MAKER"),
+      analysis: countByType("ANALYZE_WEBSITE"),
     };
 
     return NextResponse.json({ campaign, companies, jobStats });
@@ -90,7 +107,8 @@ export async function POST(_req: NextRequest, { params }: { params: Promise<{ id
       data: { status: "DISCOVERING" },
     });
 
-    return NextResponse.json({ started: true, queriesGenerated: queries.length, queries });
+    const updated = await (prisma as any).researchCampaign.findFirst({ where: { id } });
+    return NextResponse.json({ started: true, queriesGenerated: queries.length, campaign: updated });
   } catch (err: any) {
     console.error("[research/id] POST error:", err);
     return NextResponse.json({ error: err?.message ?? "Failed to start campaign" }, { status: 500 });
@@ -145,7 +163,8 @@ export async function PATCH(req: NextRequest, { params }: { params: Promise<{ id
       });
     }
 
-    return NextResponse.json({ ok: true });
+    const updated = await (prisma as any).researchCampaign.findFirst({ where: { id } });
+    return NextResponse.json({ ok: true, campaign: updated });
   } catch (err: any) {
     console.error("[research/id] PATCH error:", err);
     return NextResponse.json({ error: err?.message ?? "Failed to update campaign" }, { status: 500 });

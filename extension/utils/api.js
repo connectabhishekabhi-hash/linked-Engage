@@ -6,7 +6,7 @@
  *   3. Report job completion or failure
  */
 
-const BACKEND_URL = "http://localhost:3000"; // Change to prod URL when deployed
+const BACKEND_URL = "https://linked-engage.onrender.com";
 
 // ─── Storage helpers ──────────────────────────────────────────────────────────
 

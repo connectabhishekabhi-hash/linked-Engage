@@ -4,13 +4,14 @@
  * Persists AI comment preferences to chrome.storage.local
  */
 
-const BACKEND_URL = "http://localhost:3000";
+const BACKEND_URL = "https://linked-engage.onrender.com";
 
-const statusEl   = document.getElementById("status");
-const tokenInput = document.getElementById("tokenInput");
-const saveBtn    = document.getElementById("saveBtn");
-const pollBtn    = document.getElementById("pollBtn");
-const messageEl  = document.getElementById("message");
+const statusEl       = document.getElementById("status");
+const tokenInput     = document.getElementById("tokenInput");
+const saveBtn        = document.getElementById("saveBtn");
+const pollBtn        = document.getElementById("pollBtn");
+const disconnectBtn  = document.getElementById("disconnectBtn");
+const messageEl      = document.getElementById("message");
 
 // AI preference elements
 const aiLengthEl      = document.getElementById("aiLength");
@@ -35,6 +36,9 @@ async function loadStatus() {
     if (data.extensionToken) {
       tokenInput.value    = "••••••••••••••";
       saveBtn.textContent = "Reconnect";
+      disconnectBtn.style.display = "block";
+    } else {
+      disconnectBtn.style.display = "none";
     }
 
     // Restore AI preferences
@@ -129,6 +133,16 @@ pollBtn.addEventListener("click", () => {
     pollBtn.textContent = "Poll Now";
     loadStatus();
   });
+});
+
+// ── Disconnect button ────────────────────────────────────────────────────────
+disconnectBtn.addEventListener("click", async () => {
+  await chrome.storage.local.remove(["extensionToken", "userId", "status"]);
+  statusEl.textContent = "Not connected";
+  tokenInput.value = "";
+  saveBtn.textContent = "Connect";
+  disconnectBtn.style.display = "none";
+  showMessage("Token cleared. Paste a new API token to reconnect.", "success");
 });
 
 // ── Init ─────────────────────────────────────────────────────────────────────
