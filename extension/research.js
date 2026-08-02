@@ -159,6 +159,15 @@ function extractGoogleResults() {
     "g2.com","capterra.com","getapp.com","softwareadvice.com",
     "ea.govt.nz","govt.nz","gov.au","gov.uk","gov.in"];
 
+  // Also skip list/directory pages that aggregate companies
+  const listPagePatterns = [/best\s+\d+/i, /top\s+\d+/i, /\d+\s+best/i, /list\s+of/i, /compare/i, /review/i, /directory/i];
+
+  function domainToName(hostname) {
+    // Convert "firstlightsolar.co.nz" → "First Light Solar"
+    const base = hostname.replace(/\.(com|co|net|org|io|nz|au|uk|in|us|ca)(\.\w+)?$/i, "");
+    return base.replace(/[-_]/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+  }
+
   document.querySelectorAll("div.g").forEach(item => {
     const a = item.querySelector("a[href^='http']");
     const h3 = item.querySelector("h3");
@@ -166,7 +175,15 @@ function extractGoogleResults() {
     try {
       const hostname = new URL(a.href).hostname.replace(/^www\./, "");
       if (blocked.some(b => hostname.endsWith(b))) return;
-      results.push({ name: h3.textContent.trim(), url: a.href, domain: hostname });
+      let name = h3.textContent.trim();
+      // If the h3 text looks like a list article, use domain as name
+      if (listPagePatterns.some(p => p.test(name)) || name.length > 60) {
+        name = domainToName(hostname);
+      } else {
+        // Clean up common suffixes from h3
+        name = name.split(/\s*[|\-–]\s*/)[0].trim();
+      }
+      results.push({ name, url: a.href, domain: hostname });
     } catch {}
   });
 
@@ -178,7 +195,9 @@ function extractGoogleResults() {
         const hostname = new URL(a.href).hostname.replace(/^www\./, "");
         if (blocked.some(b => hostname.endsWith(b))) return;
         if (results.some(r => r.domain === hostname)) return;
-        results.push({ name: h3.textContent.trim(), url: a.href, domain: hostname });
+        let name = h3.textContent.trim().split(/\s*[|\-–]\s*/)[0].trim();
+        if (listPagePatterns.some(p => p.test(name)) || name.length > 60) name = domainToName(hostname);
+        results.push({ name, url: a.href, domain: hostname });
       } catch {}
     });
   }
@@ -192,7 +211,9 @@ function extractGoogleResults() {
         if (results.some(r => r.domain === hostname)) return;
         const text = a.textContent?.trim();
         if (text && text.length > 2 && text.length < 80) {
-          results.push({ name: text, url: a.href, domain: hostname });
+          let name = text.split(/\s*[|\-–]\s*/)[0].trim();
+          if (listPagePatterns.some(p => p.test(name)) || name.length > 60) name = domainToName(hostname);
+          results.push({ name, url: a.href, domain: hostname });
         }
       } catch {}
     });
@@ -267,7 +288,18 @@ function scrapeWebsite() {
     if (locMatch) address = locMatch[1].trim();
   }
 
-  return { title, socials, emails, phones, address, fbPageName, igUsername };
+  // Try to extract proper company name from page
+  let companyName = null;
+  // Check meta tags first
+  const ogSiteName = document.querySelector('meta[property="og:site_name"]')?.content;
+  if (ogSiteName && ogSiteName.length > 1 && ogSiteName.length < 60) companyName = ogSiteName;
+  // Fallback to title (first segment before | or -)
+  if (!companyName && title) {
+    companyName = title.split(/\s*[|\-–—]\s*/)[0].trim();
+    if (companyName.length > 50) companyName = null;
+  }
+
+  return { title, companyName, socials, emails, phones, address, fbPageName, igUsername };
 }
 
 // ── Step 3: Find Founder via LinkedIn Company People Page ───────────────────
@@ -404,28 +436,31 @@ async function runResearch() {
   // ── Phase 1: Google Search with pagination ──
   const queries = generateQueries(industry, location, keywords, exclude);
   const seenDomains = new Set();
+  const PAGES_PER_QUERY = 3;
+  let totalSearches = 0;
 
   for (let i = 0; i < queries.length; i++) {
     if (shouldStop) break;
     if (seenDomains.size >= maxCompanies) break;
 
-    // Each query gets page 1 and page 2 (start=0, start=10)
-    for (let page = 0; page < 2; page++) {
+    for (let page = 0; page < PAGES_PER_QUERY; page++) {
       if (shouldStop || seenDomains.size >= maxCompanies) break;
 
-      const pageLabel = page === 0 ? "" : " (page 2)";
-      setStatus(`Searching Google (${i + 1}/${queries.length})${pageLabel}...`);
-      setProgress(i * 2 + page, queries.length * 2, "Google Search");
+      totalSearches++;
+      setStatus(`Searching Google — query ${i + 1}/${queries.length}, page ${page + 1} (${seenDomains.size} found so far)...`);
+      setProgress(seenDomains.size, maxCompanies, "Google Search");
 
       const start = page * 10;
       const url = `https://www.google.com/search?q=${encodeURIComponent(queries[i])}&num=10&start=${start}`;
       const results = await openAndExtract(url, extractGoogleResults);
 
+      let newFound = 0;
       if (results?.length) {
         for (const r of results) {
           if (seenDomains.has(r.domain)) continue;
           if (seenDomains.size >= maxCompanies) break;
           seenDomains.add(r.domain);
+          newFound++;
           companies.push({
             name: r.name,
             domain: r.domain,
@@ -446,11 +481,15 @@ async function runResearch() {
       stats.found = companies.length;
       updateStats();
       renderTable();
+
+      // If this page found nothing new, skip remaining pages for this query
+      if (newFound === 0 && page > 0) break;
+
       await sleep(800 + Math.random() * 1200);
     }
   }
 
-  setProgress(1, 1, "Google Search — Complete");
+  setProgress(1, 1, `Google Search — ${companies.length} companies found`);
 
   // ── Phase 2: Scrape websites (extract socials, emails, phones, fb/ig usernames) ──
   const BATCH_SIZE = 3;
@@ -471,8 +510,8 @@ async function runResearch() {
           co.location = data.address || null;
           co.fbPageName = data.fbPageName || null;
           co.igUsername = data.igUsername || null;
-          if (data.title && (co.name.includes("|") || co.name.includes("..."))) {
-            co.name = data.title.split(/[|\-–]/)[0].trim() || co.name;
+          if (data.companyName) {
+            co.name = data.companyName;
           }
           stats.scraped++;
         }
@@ -513,10 +552,10 @@ async function runResearch() {
         }
       }
 
-      // Strategy 2: Google search for "[company] founder/CEO site:linkedin.com/in"
+      // Strategy 2: Google search using domain name (most reliable)
       if (!founderFound) {
-        const cleanName = co.name.replace(/[|\\\/\-–:].*/g, "").replace(/\s+(Ltd|Inc|LLC|Pty|Limited|Corp)\.?$/i, "").trim();
-        const q = `"${cleanName}" (founder OR CEO OR "co-founder" OR owner OR director) site:linkedin.com/in`;
+        const domainBase = co.domain.replace(/\.(com|co|net|org|io|nz|au|uk|in|us|ca)(\.\w+)?$/i, "");
+        const q = `${domainBase} founder OR CEO OR owner site:linkedin.com/in`;
         const candidates = await openAndExtract(
           `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10`,
           extractLinkedInPeopleFromGoogle
@@ -530,17 +569,19 @@ async function runResearch() {
         }
       }
 
-      // Strategy 3: Search Google for "[company] [location] founder OR CEO linkedin"
+      // Strategy 3: Use company name without quotes, broader search
       if (!founderFound) {
-        const cleanName = co.name.replace(/[|\\\/\-–:].*/g, "").trim();
-        const q = `${cleanName} ${location} founder OR CEO OR owner linkedin`;
-        const candidates = await openAndExtract(
-          `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10`,
-          extractLinkedInPeopleFromGoogle
-        );
-        if (candidates?.length) {
-          co.founder = pickBestFounder(candidates);
-          if (co.founder) stats.founders++;
+        const cleanName = co.name.replace(/[|\\\/\-–:].*/g, "").replace(/\s+(Ltd|Inc|LLC|Pty|Limited|Corp|Group)\.?$/i, "").trim();
+        if (cleanName.length > 2) {
+          const q = `${cleanName} founder OR CEO linkedin.com`;
+          const candidates = await openAndExtract(
+            `https://www.google.com/search?q=${encodeURIComponent(q)}&num=10`,
+            extractLinkedInPeopleFromGoogle
+          );
+          if (candidates?.length) {
+            co.founder = pickBestFounder(candidates);
+            if (co.founder) stats.founders++;
+          }
         }
       }
     } catch (err) {
